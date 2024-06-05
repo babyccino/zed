@@ -1,6 +1,7 @@
 use anyhow;
 use collections::HashMap;
 use futures::{future::join_all, Future};
+use itertools::Itertools;
 use serde::Deserialize;
 use std::{fmt, mem, sync::Arc};
 
@@ -319,7 +320,7 @@ impl EasyMotion {
                     (editor, bounding_box)
                 })
             })
-            .collect::<Vec<_>>()
+            .collect_vec()
     }
 
     fn workspace_has_multiple_editors(workspace: &Workspace, cx: &WindowContext) -> bool {
@@ -469,7 +470,7 @@ impl EasyMotion {
                 .await
                 .into_iter()
                 .flatten()
-                .collect::<Vec<_>>();
+                .collect_vec();
             if search_matches.is_empty() {
                 return None;
             }
@@ -609,7 +610,7 @@ impl EasyMotion {
                             .and_then(|item| item.downcast::<Editor>())
                     })
                 })
-                .collect::<Vec<_>>();
+                .collect_vec();
 
             Self::update_editors(Some(&new_state), true, editors.into_iter(), cx);
 

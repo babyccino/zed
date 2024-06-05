@@ -439,16 +439,15 @@ impl<'a, T> Iterator for TrieIterator<'a, T> {
 
 #[cfg(test)]
 mod tests {
+    use itertools::Itertools;
+
     use super::*;
 
     fn perms_helper(trie: &Trie<i32>, perms: Vec<(&str, i32)>) {
         let trie_perms = trie.trie_to_perms();
         assert_eq!(
             trie_perms,
-            perms
-                .iter()
-                .map(|(a, b)| (a.to_string(), b))
-                .collect::<Vec<_>>()
+            perms.iter().map(|(a, b)| (a.to_string(), b)).collect_vec()
         );
     }
 
@@ -457,10 +456,7 @@ mod tests {
         let trie_perms = trie.trie_to_perms_rev();
         assert_eq!(
             trie_perms,
-            perms
-                .iter()
-                .map(|(a, b)| (a.to_string(), b))
-                .collect::<Vec<_>>()
+            perms.iter().map(|(a, b)| (a.to_string(), b)).collect_vec()
         );
     }
 

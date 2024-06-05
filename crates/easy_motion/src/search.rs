@@ -1,4 +1,5 @@
 use futures::{Future, FutureExt};
+use itertools::Itertools;
 use language::{char_kind, coerce_punctuation, CharKind};
 use multi_buffer::MultiBufferPoint;
 use std::{cmp::Ordering, ops::Range, sync::Arc};
@@ -154,7 +155,7 @@ pub fn get_word_starts_task(
                 bounding_box.origin.x + 2.0 * map.x_for_display_point(*word, &text_layout_details)
             })
             // to get around borrowing issue, just change this and below into boomer loop
-            .collect::<Vec<_>>()
+            .collect_vec()
             .into_iter();
         words
             .into_iter()
@@ -164,7 +165,7 @@ pub fn get_word_starts_task(
                 let p = point(x, y) - scroll_pixel_position;
                 (word, entity_id, p)
             })
-            .collect::<Vec<_>>()
+            .collect_vec()
     })
 }
 
@@ -252,7 +253,7 @@ pub fn search_multipane(
                     let y = Pixels(y);
                     (word, entity_id, Point::new(x, y))
                 })
-                .collect::<Vec<_>>()
+                .collect_vec()
         });
     Some(matches)
 }
@@ -277,7 +278,7 @@ pub fn row_starts(
                 Some(map.point_to_display_point(MultiBufferPoint::new(row.0, 0), Bias::Left))
             }
         })
-        .collect::<Vec<_>>()
+        .collect_vec()
 }
 
 pub fn row_starts_multipane(
@@ -319,7 +320,7 @@ pub fn row_starts_multipane(
                     Some((point, entity_id, Point::new(x, y)))
                 }
             })
-            .collect::<Vec<_>>()
+            .collect_vec()
     })
 }
 
