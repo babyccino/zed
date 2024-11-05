@@ -1,3 +1,6 @@
+// We allow missing docs for stories as the docs will more or less be
+// "This is the ___ story", which is not very useful.
+#![allow(missing_docs)]
 mod avatar;
 mod button;
 mod checkbox;
@@ -10,7 +13,6 @@ mod label;
 mod list;
 mod list_header;
 mod list_item;
-mod setting;
 mod tab;
 mod tab_bar;
 mod toggle_button;
@@ -28,7 +30,6 @@ pub use label::*;
 pub use list::*;
 pub use list_header::*;
 pub use list_item::*;
-pub use setting::*;
 pub use tab::*;
 pub use tab_bar::*;
 pub use toggle_button::*;

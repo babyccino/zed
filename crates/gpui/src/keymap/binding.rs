@@ -57,7 +57,7 @@ impl KeyBinding {
             }
         }
 
-        return Some(self.keystrokes.len() > typed.len());
+        Some(self.keystrokes.len() > typed.len())
     }
 
     /// Get the keystrokes associated with this binding
@@ -68,6 +68,11 @@ impl KeyBinding {
     /// Get the action associated with this binding
     pub fn action(&self) -> &dyn Action {
         self.action.as_ref()
+    }
+
+    /// Get the predicate used to match this binding
+    pub fn predicate(&self) -> Option<&KeyBindingContextPredicate> {
+        self.context_predicate.as_ref()
     }
 }
 

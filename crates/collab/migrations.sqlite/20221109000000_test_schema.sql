@@ -9,12 +9,15 @@ CREATE TABLE "users" (
     "connected_once" BOOLEAN NOT NULL DEFAULT false,
     "created_at" TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "metrics_id" TEXT,
-    "github_user_id" INTEGER
+    "github_user_id" INTEGER NOT NULL,
+    "accepted_tos_at" TIMESTAMP WITHOUT TIME ZONE,
+    "github_user_created_at" TIMESTAMP WITHOUT TIME ZONE,
+    "custom_llm_monthly_allowance_in_cents" INTEGER
 );
 CREATE UNIQUE INDEX "index_users_github_login" ON "users" ("github_login");
 CREATE UNIQUE INDEX "index_invite_code_users" ON "users" ("invite_code");
 CREATE INDEX "index_users_on_email_address" ON "users" ("email_address");
-CREATE INDEX "index_users_on_github_user_id" ON "users" ("github_user_id");
+CREATE UNIQUE INDEX "index_users_on_github_user_id" ON "users" ("github_user_id");
 
 CREATE TABLE "access_tokens" (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -49,9 +52,7 @@ CREATE TABLE "projects" (
     "host_user_id" INTEGER REFERENCES users (id),
     "host_connection_id" INTEGER,
     "host_connection_server_id" INTEGER REFERENCES servers (id) ON DELETE CASCADE,
-    "unregistered" BOOLEAN NOT NULL DEFAULT FALSE,
-    "hosted_project_id" INTEGER REFERENCES hosted_projects (id),
-    "dev_server_project_id" INTEGER REFERENCES dev_server_projects(id)
+    "unregistered" BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX "index_projects_on_host_connection_server_id" ON "projects" ("host_connection_server_id");
 CREATE INDEX "index_projects_on_host_connection_id_and_host_connection_server_id" ON "projects" ("host_connection_id", "host_connection_server_id");
@@ -76,14 +77,15 @@ CREATE TABLE "worktree_entries" (
     "id" INTEGER NOT NULL,
     "is_dir" BOOL NOT NULL,
     "path" VARCHAR NOT NULL,
+    "canonical_path" TEXT,
     "inode" INTEGER NOT NULL,
     "mtime_seconds" INTEGER NOT NULL,
     "mtime_nanos" INTEGER NOT NULL,
-    "is_symlink" BOOL NOT NULL,
     "is_external" BOOL NOT NULL,
     "is_ignored" BOOL NOT NULL,
     "is_deleted" BOOL NOT NULL,
     "git_status" INTEGER,
+    "is_fifo" BOOL NOT NULL,
     PRIMARY KEY(project_id, worktree_id, id),
     FOREIGN KEY(project_id, worktree_id) REFERENCES worktrees (project_id, id) ON DELETE CASCADE
 );
@@ -109,6 +111,7 @@ CREATE TABLE "worktree_settings_files" (
     "worktree_id" INTEGER NOT NULL,
     "path" VARCHAR NOT NULL,
     "content" TEXT,
+    "kind" VARCHAR,
     PRIMARY KEY(project_id, worktree_id, path),
     FOREIGN KEY(project_id, worktree_id) REFERENCES worktrees (project_id, id) ON DELETE CASCADE
 );
@@ -293,7 +296,8 @@ CREATE UNIQUE INDEX "index_channel_buffer_collaborators_on_channel_id_connection
 
 CREATE TABLE "feature_flags" (
     "id" INTEGER PRIMARY KEY AUTOINCREMENT,
-    "flag" TEXT NOT NULL UNIQUE
+    "flag" TEXT NOT NULL UNIQUE,
+    "enabled_for_all" BOOLEAN NOT NULL DEFAULT false
 );
 
 CREATE INDEX "index_feature_flags" ON "feature_flags" ("id");
@@ -393,26 +397,42 @@ CREATE TABLE rate_buckets (
 );
 CREATE INDEX idx_user_id_rate_limit ON rate_buckets (user_id, rate_limit_name);
 
-CREATE TABLE hosted_projects (
+CREATE TABLE IF NOT EXISTS billing_preferences (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel_id INTEGER NOT NULL REFERENCES channels(id),
-    name TEXT NOT NULL,
-    visibility TEXT NOT NULL,
-    deleted_at TIMESTAMP NULL
-);
-CREATE INDEX idx_hosted_projects_on_channel_id ON hosted_projects (channel_id);
-CREATE UNIQUE INDEX uix_hosted_projects_on_channel_id_and_name ON hosted_projects (channel_id, name) WHERE (deleted_at IS NULL);
-
-CREATE TABLE dev_servers (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     user_id INTEGER NOT NULL REFERENCES users(id),
-    name TEXT NOT NULL,
-    ssh_connection_string TEXT,
-    hashed_token TEXT NOT NULL
+    max_monthly_llm_usage_spending_in_cents INTEGER NOT NULL
 );
 
-CREATE TABLE dev_server_projects (
+CREATE UNIQUE INDEX "uix_billing_preferences_on_user_id" ON billing_preferences (user_id);
+
+CREATE TABLE IF NOT EXISTS billing_customers (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    dev_server_id INTEGER NOT NULL REFERENCES dev_servers(id),
-    paths TEXT NOT NULL
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    stripe_customer_id TEXT NOT NULL
 );
+
+CREATE UNIQUE INDEX "uix_billing_customers_on_user_id" ON billing_customers (user_id);
+CREATE UNIQUE INDEX "uix_billing_customers_on_stripe_customer_id" ON billing_customers (stripe_customer_id);
+
+CREATE TABLE IF NOT EXISTS billing_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    billing_customer_id INTEGER NOT NULL REFERENCES billing_customers(id),
+    stripe_subscription_id TEXT NOT NULL,
+    stripe_subscription_status TEXT NOT NULL,
+    stripe_cancel_at TIMESTAMP
+);
+
+CREATE INDEX "ix_billing_subscriptions_on_billing_customer_id" ON billing_subscriptions (billing_customer_id);
+CREATE UNIQUE INDEX "uix_billing_subscriptions_on_stripe_subscription_id" ON billing_subscriptions (stripe_subscription_id);
+
+CREATE TABLE IF NOT EXISTS processed_stripe_events (
+    stripe_event_id TEXT PRIMARY KEY,
+    stripe_event_type TEXT NOT NULL,
+    stripe_event_created_timestamp INTEGER NOT NULL,
+    processed_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX "ix_processed_stripe_events_on_stripe_event_created_timestamp" ON processed_stripe_events (stripe_event_created_timestamp);

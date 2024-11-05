@@ -1,3 +1,4 @@
+use collections::HashMap;
 pub use ipc_channel::ipc;
 use serde::{Deserialize, Serialize};
 
@@ -14,7 +15,7 @@ pub enum CliRequest {
         urls: Vec<String>,
         wait: bool,
         open_new_workspace: Option<bool>,
-        dev_server_token: Option<String>,
+        env: Option<HashMap<String, String>>,
     },
 }
 

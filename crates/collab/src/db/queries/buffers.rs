@@ -116,6 +116,7 @@ impl Database {
                         peer_id: Some(collaborator.connection().into()),
                         user_id: collaborator.user_id.to_proto(),
                         replica_id: collaborator.replica_id.0 as u32,
+                        is_host: false,
                     })
                     .collect(),
             })
@@ -222,6 +223,7 @@ impl Database {
                                 peer_id: Some(collaborator.connection().into()),
                                 user_id: collaborator.user_id.to_proto(),
                                 replica_id: collaborator.replica_id.0 as u32,
+                                is_host: false,
                             })
                             .collect(),
                     },
@@ -257,6 +259,7 @@ impl Database {
                         peer_id: Some(db_collaborator.connection().into()),
                         replica_id: db_collaborator.replica_id.0 as u32,
                         user_id: db_collaborator.user_id.to_proto(),
+                        is_host: false,
                     })
                 } else {
                     collaborator_ids_to_remove.push(db_collaborator.id);
@@ -385,13 +388,14 @@ impl Database {
                 peer_id: Some(connection.into()),
                 replica_id: row.replica_id.0 as u32,
                 user_id: row.user_id.to_proto(),
+                is_host: false,
             });
         }
 
         drop(rows);
 
         if collaborators.is_empty() {
-            self.snapshot_channel_buffer(channel_id, &tx).await?;
+            self.snapshot_channel_buffer(channel_id, tx).await?;
         }
 
         Ok(LeftChannelBuffer {
@@ -689,9 +693,7 @@ impl Database {
         }
 
         let mut text_buffer = text::Buffer::new(0, text::BufferId::new(1).unwrap(), base_text);
-        text_buffer
-            .apply_ops(operations.into_iter().filter_map(operation_from_wire))
-            .unwrap();
+        text_buffer.apply_ops(operations.into_iter().filter_map(operation_from_wire));
 
         let base_text = text_buffer.text();
         let epoch = buffer.epoch + 1;
@@ -872,7 +874,7 @@ fn operation_from_storage(
     })
 }
 
-fn version_to_storage(version: &Vec<proto::VectorClockEntry>) -> Vec<storage::VectorClockEntry> {
+fn version_to_storage(version: &[proto::VectorClockEntry]) -> Vec<storage::VectorClockEntry> {
     version
         .iter()
         .map(|entry| storage::VectorClockEntry {
@@ -882,7 +884,7 @@ fn version_to_storage(version: &Vec<proto::VectorClockEntry>) -> Vec<storage::Ve
         .collect()
 }
 
-fn version_from_storage(version: &Vec<storage::VectorClockEntry>) -> Vec<proto::VectorClockEntry> {
+fn version_from_storage(version: &[storage::VectorClockEntry]) -> Vec<proto::VectorClockEntry> {
     version
         .iter()
         .map(|entry| proto::VectorClockEntry {

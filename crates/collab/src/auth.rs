@@ -1,5 +1,5 @@
 use crate::{
-    db::{self, dev_server, AccessTokenId, Database, DevServerId, UserId},
+    db::{self, AccessTokenId, Database, UserId},
     rpc::Principal,
     AppState, Error, Result,
 };
@@ -33,7 +33,7 @@ pub async fn validate_header<B>(mut req: Request<B>, next: Next<B>) -> impl Into
         .get(http::header::AUTHORIZATION)
         .and_then(|header| header.to_str().ok())
         .ok_or_else(|| {
-            Error::Http(
+            Error::http(
                 StatusCode::UNAUTHORIZED,
                 "missing authorization header".to_string(),
             )
@@ -44,30 +44,21 @@ pub async fn validate_header<B>(mut req: Request<B>, next: Next<B>) -> impl Into
 
     let first = auth_header.next().unwrap_or("");
     if first == "dev-server-token" {
-        let dev_server_token = auth_header.next().ok_or_else(|| {
-            Error::Http(
-                StatusCode::BAD_REQUEST,
-                "missing dev-server-token token in authorization header".to_string(),
-            )
-        })?;
-        let dev_server = verify_dev_server_token(dev_server_token, &state.db)
-            .await
-            .map_err(|e| Error::Http(StatusCode::UNAUTHORIZED, format!("{}", e)))?;
-
-        req.extensions_mut()
-            .insert(Principal::DevServer(dev_server));
-        return Ok::<_, Error>(next.run(req).await);
+        Err(Error::http(
+            StatusCode::UNAUTHORIZED,
+            "Dev servers were removed in Zed 0.157 please upgrade to SSH remoting".to_string(),
+        ))?;
     }
 
     let user_id = UserId(first.parse().map_err(|_| {
-        Error::Http(
+        Error::http(
             StatusCode::BAD_REQUEST,
             "missing user id in authorization header".to_string(),
         )
     })?);
 
     let access_token = auth_header.next().ok_or_else(|| {
-        Error::Http(
+        Error::http(
             StatusCode::BAD_REQUEST,
             "missing access token in authorization header".to_string(),
         )
@@ -85,7 +76,7 @@ pub async fn validate_header<B>(mut req: Request<B>, next: Next<B>) -> impl Into
             impersonator_id: None,
         })
     } else {
-        verify_access_token(&access_token, user_id, &state.db).await
+        verify_access_token(access_token, user_id, &state.db).await
     };
 
     if let Ok(validate_result) = validate_result {
@@ -111,7 +102,7 @@ pub async fn validate_header<B>(mut req: Request<B>, next: Next<B>) -> impl Into
         }
     }
 
-    Err(Error::Http(
+    Err(Error::http(
         StatusCode::UNAUTHORIZED,
         "invalid credentials".to_string(),
     ))
@@ -202,7 +193,7 @@ pub async fn verify_access_token(
         .unwrap()
     });
 
-    let token: AccessTokenJson = serde_json::from_str(&token)?;
+    let token: AccessTokenJson = serde_json::from_str(token)?;
 
     let db_token = db.get_access_token(token.id).await?;
     let token_user_id = db_token.impersonated_user_id.unwrap_or(db_token.user_id);
@@ -240,41 +231,6 @@ pub async fn verify_access_token(
     })
 }
 
-pub fn generate_dev_server_token(id: usize, access_token: String) -> String {
-    format!("{}.{}", id, access_token)
-}
-
-pub async fn verify_dev_server_token(
-    dev_server_token: &str,
-    db: &Arc<Database>,
-) -> anyhow::Result<dev_server::Model> {
-    let (id, token) = split_dev_server_token(dev_server_token)?;
-    let token_hash = hash_access_token(&token);
-    let server = db.get_dev_server(id).await?;
-
-    if server
-        .hashed_token
-        .as_bytes()
-        .ct_eq(token_hash.as_ref())
-        .into()
-    {
-        Ok(server)
-    } else {
-        Err(anyhow!("wrong token for dev server"))
-    }
-}
-
-// a dev_server_token has the format <id>.<base64>. This is to make them
-// relatively easy to copy/paste around.
-pub fn split_dev_server_token(dev_server_token: &str) -> anyhow::Result<(DevServerId, &str)> {
-    let mut parts = dev_server_token.splitn(2, '.');
-    let id = DevServerId(parts.next().unwrap_or_default().parse()?);
-    let token = parts
-        .next()
-        .ok_or_else(|| anyhow!("invalid dev server token format"))?;
-    Ok((id, token))
-}
-
 #[cfg(test)]
 mod test {
     use rand::thread_rng;
@@ -301,18 +257,16 @@ mod test {
             .await
             .unwrap();
 
-        let token = create_access_token(&db, user.user_id, None).await.unwrap();
+        let token = create_access_token(db, user.user_id, None).await.unwrap();
         assert!(matches!(
-            verify_access_token(&token, user.user_id, &db)
-                .await
-                .unwrap(),
+            verify_access_token(&token, user.user_id, db).await.unwrap(),
             VerifyAccessTokenResult {
                 is_valid: true,
                 impersonator_id: None,
             }
         ));
 
-        let old_token = create_previous_access_token(user.user_id, None, &db)
+        let old_token = create_previous_access_token(user.user_id, None, db)
             .await
             .unwrap();
 
@@ -333,7 +287,7 @@ mod test {
         assert!(hash.starts_with("$scrypt$"));
 
         assert!(matches!(
-            verify_access_token(&old_token, user.user_id, &db)
+            verify_access_token(&old_token, user.user_id, db)
                 .await
                 .unwrap(),
             VerifyAccessTokenResult {
@@ -355,7 +309,7 @@ mod test {
         assert!(hash.starts_with("$sha256$"));
 
         assert!(matches!(
-            verify_access_token(&old_token, user.user_id, &db)
+            verify_access_token(&old_token, user.user_id, db)
                 .await
                 .unwrap(),
             VerifyAccessTokenResult {
@@ -365,9 +319,7 @@ mod test {
         ));
 
         assert!(matches!(
-            verify_access_token(&token, user.user_id, &db)
-                .await
-                .unwrap(),
+            verify_access_token(&token, user.user_id, db).await.unwrap(),
             VerifyAccessTokenResult {
                 is_valid: true,
                 impersonator_id: None,

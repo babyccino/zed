@@ -4,7 +4,7 @@ use gpui::{HighlightStyle, Model, StyledText};
 use picker::{Picker, PickerDelegate};
 use project::{Entry, PathMatchCandidateSet, Project, ProjectPath, WorktreeId};
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         atomic::{self, AtomicBool},
         Arc,
@@ -107,8 +107,10 @@ impl Match {
 
         if let Some(path_match) = &self.path_match {
             text.push_str(&path_match.path.to_string_lossy());
+            let mut whole_path = PathBuf::from(path_match.path_prefix.to_string());
+            whole_path = whole_path.join(path_match.path.clone());
             for (range, style) in highlight_ranges(
-                &path_match.path.to_string_lossy(),
+                &whole_path.to_string_lossy(),
                 &path_match.positions,
                 gpui::HighlightStyle::color(Color::Accent.color(cx)),
             ) {
@@ -248,7 +250,11 @@ impl PickerDelegate for NewPathDelegate {
         query: String,
         cx: &mut ViewContext<picker::Picker<Self>>,
     ) -> gpui::Task<()> {
-        let query = query.trim().trim_start_matches('/');
+        let query = query
+            .trim()
+            .trim_start_matches("./")
+            .trim_start_matches('/');
+
         let (dir, suffix) = if let Some(index) = query.rfind('/') {
             let suffix = if index + 1 < query.len() {
                 Some(query[index + 1..].to_string())
@@ -310,6 +316,14 @@ impl PickerDelegate for NewPathDelegate {
                 })
                 .log_err();
         })
+    }
+
+    fn confirm_completion(
+        &mut self,
+        _: String,
+        cx: &mut ViewContext<Picker<Self>>,
+    ) -> Option<String> {
+        self.confirm_update_query(cx)
     }
 
     fn confirm_update_query(&mut self, cx: &mut ViewContext<Picker<Self>>) -> Option<String> {
@@ -417,7 +431,32 @@ impl NewPathDelegate {
     ) {
         cx.notify();
         if query.is_empty() {
-            self.matches = vec![];
+            self.matches = self
+                .project
+                .read(cx)
+                .worktrees(cx)
+                .flat_map(|worktree| {
+                    let worktree_id = worktree.read(cx).id();
+                    worktree
+                        .read(cx)
+                        .child_entries(Path::new(""))
+                        .filter_map(move |entry| {
+                            entry.is_dir().then(|| Match {
+                                path_match: Some(PathMatch {
+                                    score: 1.0,
+                                    positions: Default::default(),
+                                    worktree_id: worktree_id.to_usize(),
+                                    path: entry.path.clone(),
+                                    path_prefix: "".into(),
+                                    is_dir: entry.is_dir(),
+                                    distance_to_relative_ancestor: 0,
+                                }),
+                                suffix: None,
+                            })
+                        })
+                })
+                .collect();
+
             return;
         }
 

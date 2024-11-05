@@ -1,4 +1,8 @@
-use crate::{pane_group::element::pane_axis, AppState, FollowerState, Pane, Workspace};
+use crate::{
+    pane_group::element::pane_axis,
+    workspace_settings::{PaneSplitDirectionHorizontal, PaneSplitDirectionVertical},
+    AppState, FollowerState, Pane, Workspace, WorkspaceSettings,
+};
 use anyhow::{anyhow, Result};
 use call::{ActiveCall, ParticipantLocation};
 use client::proto::PeerId;
@@ -10,6 +14,7 @@ use gpui::{
 use parking_lot::Mutex;
 use project::Project;
 use serde::Deserialize;
+use settings::Settings;
 use std::sync::Arc;
 use ui::prelude::*;
 
@@ -561,6 +566,20 @@ impl SplitDirection {
         [Self::Up, Self::Down, Self::Left, Self::Right]
     }
 
+    pub fn vertical(cx: &WindowContext) -> Self {
+        match WorkspaceSettings::get_global(cx).pane_split_direction_vertical {
+            PaneSplitDirectionVertical::Left => SplitDirection::Left,
+            PaneSplitDirectionVertical::Right => SplitDirection::Right,
+        }
+    }
+
+    pub fn horizontal(cx: &WindowContext) -> Self {
+        match WorkspaceSettings::get_global(cx).pane_split_direction_horizontal {
+            PaneSplitDirectionHorizontal::Down => SplitDirection::Down,
+            PaneSplitDirectionHorizontal::Up => SplitDirection::Up,
+        }
+    }
+
     pub fn edge(&self, rect: Bounds<Pixels>) -> Pixels {
         match self {
             Self::Up => rect.origin.y,
@@ -612,7 +631,7 @@ mod element {
     use std::{cell::RefCell, iter, rc::Rc, sync::Arc};
 
     use gpui::{
-        px, relative, Along, AnyElement, Axis, Bounds, Element, GlobalElementId, IntoElement,
+        px, relative, size, Along, AnyElement, Axis, Bounds, Element, GlobalElementId, IntoElement,
         MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels, Point, Size, Style,
         WeakView, WindowContext,
     };
@@ -819,12 +838,13 @@ mod element {
             _global_id: Option<&GlobalElementId>,
             cx: &mut ui::prelude::WindowContext,
         ) -> (gpui::LayoutId, Self::RequestLayoutState) {
-            let mut style = Style::default();
-            style.flex_grow = 1.;
-            style.flex_shrink = 1.;
-            style.flex_basis = relative(0.).into();
-            style.size.width = relative(1.).into();
-            style.size.height = relative(1.).into();
+            let style = Style {
+                flex_grow: 1.,
+                flex_shrink: 1.,
+                flex_basis: relative(0.).into(),
+                size: size(relative(1.).into(), relative(1.).into()),
+                ..Style::default()
+            };
             (cx.request_layout(style, None), ())
         }
 
@@ -847,12 +867,10 @@ mod element {
             debug_assert!(flexes.len() == len);
             debug_assert!(flex_values_in_bounds(flexes.as_slice()));
 
-            let magnification_value = WorkspaceSettings::get(None, cx).active_pane_magnification;
-            let active_pane_magnification = if magnification_value == 1. {
-                None
-            } else {
-                Some(magnification_value)
-            };
+            let active_pane_magnification = WorkspaceSettings::get(None, cx)
+                .active_pane_modifiers
+                .magnification
+                .and_then(|val| if val == 1.0 { None } else { Some(val) });
 
             let total_flex = if let Some(flex) = active_pane_magnification {
                 self.children.len() as f32 - 1. + flex
@@ -890,6 +908,7 @@ mod element {
                     origin,
                     size: child_size,
                 };
+
                 bounding_boxes.push(Some(child_bounds));
                 child.layout_as_root(child_size.into(), cx);
                 child.prepaint_at(origin, cx);
@@ -903,11 +922,9 @@ mod element {
             }
 
             for (ix, child_layout) in layout.children.iter_mut().enumerate() {
-                if active_pane_magnification.is_none() {
-                    if ix < len - 1 {
-                        child_layout.handle =
-                            Some(Self::layout_handle(self.axis, child_layout.bounds, cx));
-                    }
+                if active_pane_magnification.is_none() && ix < len - 1 {
+                    child_layout.handle =
+                        Some(Self::layout_handle(self.axis, child_layout.bounds, cx));
                 }
             }
 
@@ -926,7 +943,54 @@ mod element {
                 child.element.paint(cx);
             }
 
+            let overlay_opacity = WorkspaceSettings::get(None, cx)
+                .active_pane_modifiers
+                .inactive_opacity
+                .map(|val| val.clamp(0.0, 1.0))
+                .and_then(|val| (val <= 1.).then_some(val));
+
+            let mut overlay_background = cx.theme().colors().editor_background;
+            if let Some(opacity) = overlay_opacity {
+                overlay_background.fade_out(opacity);
+            }
+
+            let overlay_border = WorkspaceSettings::get(None, cx)
+                .active_pane_modifiers
+                .border_size
+                .and_then(|val| (val >= 0.).then_some(val));
+
             for (ix, child) in &mut layout.children.iter_mut().enumerate() {
+                if overlay_opacity.is_some() || overlay_border.is_some() {
+                    // the overlay has to be painted in origin+1px with size width-1px
+                    // in order to accommodate the divider between panels
+                    let overlay_bounds = Bounds {
+                        origin: child
+                            .bounds
+                            .origin
+                            .apply_along(Axis::Horizontal, |val| val + Pixels(1.)),
+                        size: child
+                            .bounds
+                            .size
+                            .apply_along(Axis::Horizontal, |val| val - Pixels(1.)),
+                    };
+
+                    if overlay_opacity.is_some() && self.active_pane_ix != Some(ix) {
+                        cx.paint_quad(gpui::fill(overlay_bounds, overlay_background));
+                    }
+
+                    if let Some(border) = overlay_border {
+                        if self.active_pane_ix == Some(ix) {
+                            cx.paint_quad(gpui::quad(
+                                overlay_bounds,
+                                0.,
+                                gpui::transparent_black(),
+                                border,
+                                cx.theme().colors().border_selected,
+                            ));
+                        }
+                    }
+                }
+
                 if let Some(handle) = child.handle.as_mut() {
                     let cursor_style = match self.axis {
                         Axis::Vertical => CursorStyle::ResizeRow,
@@ -967,19 +1031,17 @@ mod element {
                         let axis = self.axis;
                         move |e: &MouseMoveEvent, phase, cx| {
                             let dragged_handle = dragged_handle.borrow();
-                            if phase.bubble() {
-                                if *dragged_handle == Some(ix) {
-                                    Self::compute_resize(
-                                        &flexes,
-                                        e,
-                                        ix,
-                                        axis,
-                                        child_bounds.origin,
-                                        bounds.size,
-                                        workspace.clone(),
-                                        cx,
-                                    )
-                                }
+                            if phase.bubble() && *dragged_handle == Some(ix) {
+                                Self::compute_resize(
+                                    &flexes,
+                                    e,
+                                    ix,
+                                    axis,
+                                    child_bounds.origin,
+                                    bounds.size,
+                                    workspace.clone(),
+                                    cx,
+                                )
                             }
                         }
                     });

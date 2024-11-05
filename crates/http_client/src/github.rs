@@ -34,7 +34,7 @@ pub async fn latest_github_release(
 ) -> Result<GithubRelease, anyhow::Error> {
     let mut response = http
         .get(
-            &format!("https://api.github.com/repos/{repo_name_with_owner}/releases"),
+            format!("https://api.github.com/repos/{repo_name_with_owner}/releases").as_str(),
             Default::default(),
             true,
         )
@@ -91,13 +91,14 @@ pub async fn get_release_by_tag_name(
         .context("error fetching latest release")?;
 
     let mut body = Vec::new();
+    let status = response.status();
     response
         .body_mut()
         .read_to_end(&mut body)
         .await
         .context("error reading latest release")?;
 
-    if response.status().is_client_error() {
+    if status.is_client_error() {
         let text = String::from_utf8_lossy(body.as_slice());
         bail!(
             "status error {}, response: {text:?}",
@@ -117,33 +118,50 @@ pub async fn get_release_by_tag_name(
     Ok(release)
 }
 
-pub fn build_tarball_url(repo_name_with_owner: &str, tag: &str) -> Result<String> {
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum AssetKind {
+    TarGz,
+    Zip,
+}
+
+pub fn build_asset_url(repo_name_with_owner: &str, tag: &str, kind: AssetKind) -> Result<String> {
     let mut url = Url::parse(&format!(
         "https://github.com/{repo_name_with_owner}/archive/refs/tags",
     ))?;
     // We're pushing this here, because tags may contain `/` and other characters
     // that need to be escaped.
-    let tarball_filename = format!("{}.tar.gz", tag);
+    let asset_filename = format!(
+        "{tag}.{extension}",
+        extension = match kind {
+            AssetKind::TarGz => "tar.gz",
+            AssetKind::Zip => "zip",
+        }
+    );
     url.path_segments_mut()
         .map_err(|_| anyhow!("cannot modify url path segments"))?
-        .push(&tarball_filename);
+        .push(&asset_filename);
     Ok(url.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::github::build_tarball_url;
+    use crate::github::{build_asset_url, AssetKind};
 
     #[test]
-    fn test_build_tarball_url() {
+    fn test_build_asset_url() {
         let tag = "release/2.3.5";
         let repo_name_with_owner = "microsoft/vscode-eslint";
 
-        let have = build_tarball_url(repo_name_with_owner, tag).unwrap();
-
+        let tarball = build_asset_url(repo_name_with_owner, tag, AssetKind::TarGz).unwrap();
         assert_eq!(
-            have,
+            tarball,
             "https://github.com/microsoft/vscode-eslint/archive/refs/tags/release%2F2.3.5.tar.gz"
+        );
+
+        let zip = build_asset_url(repo_name_with_owner, tag, AssetKind::Zip).unwrap();
+        assert_eq!(
+            zip,
+            "https://github.com/microsoft/vscode-eslint/archive/refs/tags/release%2F2.3.5.zip"
         );
     }
 }

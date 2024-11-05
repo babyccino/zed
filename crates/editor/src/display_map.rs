@@ -12,7 +12,7 @@
 //! - [`WrapMap`] that handles soft wrapping.
 //! - [`BlockMap`] that tracks custom blocks such as diagnostics that should be displayed within buffer.
 //! - [`DisplayMap`] that adds background highlights to the regions of text.
-//! Each one of those builds on top of preceding map.
+//!   Each one of those builds on top of preceding map.
 //!
 //! [Editor]: crate::Editor
 //! [EditorElement]: crate::element::EditorElement
@@ -21,6 +21,7 @@ mod block_map;
 mod crease_map;
 mod fold_map;
 mod inlay_map;
+pub(crate) mod invisibles;
 mod tab_map;
 mod wrap_map;
 
@@ -28,8 +29,8 @@ use crate::{
     hover_links::InlayHighlight, movement::TextLayoutDetails, EditorStyle, InlayId, RowExt,
 };
 pub use block_map::{
-    Block, BlockBufferRows, BlockChunks as DisplayChunks, BlockContext, BlockDisposition, BlockId,
-    BlockMap, BlockPoint, BlockProperties, BlockStyle, CustomBlockId, RenderBlock,
+    Block, BlockBufferRows, BlockChunks as DisplayChunks, BlockContext, BlockId, BlockMap,
+    BlockPlacement, BlockPoint, BlockProperties, BlockStyle, CustomBlockId, RenderBlock,
 };
 use block_map::{BlockRow, BlockSnapshot};
 use collections::{HashMap, HashSet};
@@ -42,6 +43,7 @@ use gpui::{
 pub(crate) use inlay_map::Inlay;
 use inlay_map::{InlayMap, InlaySnapshot};
 pub use inlay_map::{InlayOffset, InlayPoint};
+use invisibles::{is_invisible, replacement};
 use language::{
     language_settings::language_settings, ChunkRenderer, OffsetUtf16, Point,
     Subscription as BufferSubscription,
@@ -56,6 +58,7 @@ use std::{
     any::TypeId,
     borrow::Cow,
     fmt::Debug,
+    iter,
     num::NonZeroU32,
     ops::{Add, Range, Sub},
     sync::Arc,
@@ -63,7 +66,8 @@ use std::{
 use sum_tree::{Bias, TreeMap};
 use tab_map::{TabMap, TabSnapshot};
 use text::LineIndent;
-use ui::WindowContext;
+use ui::{div, px, IntoElement, ParentElement, SharedString, Styled, WindowContext};
+use unicode_segmentation::UnicodeSegmentation;
 use wrap_map::{WrapMap, WrapSnapshot};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -73,8 +77,6 @@ pub enum FoldStatus {
 }
 
 pub type RenderFoldToggle = Arc<dyn Fn(FoldStatus, &mut WindowContext) -> AnyElement>;
-
-const UNNECESSARY_CODE_FADE: f32 = 0.3;
 
 pub trait ToDisplayPoint {
     fn to_display_point(&self, map: &DisplaySnapshot) -> DisplayPoint;
@@ -107,7 +109,7 @@ pub struct DisplayMap {
     inlay_highlights: InlayHighlights,
     /// A container for explicitly foldable ranges, which supersede indentation based fold range suggestions.
     crease_map: CreaseMap,
-    fold_placeholder: FoldPlaceholder,
+    pub(crate) fold_placeholder: FoldPlaceholder,
     pub clip_at_line_ends: bool,
     pub(crate) masked: bool,
 }
@@ -120,16 +122,18 @@ impl DisplayMap {
         font_size: Pixels,
         wrap_width: Option<Pixels>,
         show_excerpt_controls: bool,
-        buffer_header_height: u8,
-        excerpt_header_height: u8,
-        excerpt_footer_height: u8,
+        buffer_header_height: u32,
+        excerpt_header_height: u32,
+        excerpt_footer_height: u32,
         fold_placeholder: FoldPlaceholder,
         cx: &mut ModelContext<Self>,
     ) -> Self {
         let buffer_subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
 
         let tab_size = Self::tab_size(&buffer, cx);
-        let (inlay_map, snapshot) = InlayMap::new(buffer.read(cx).snapshot(cx));
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        let crease_map = CreaseMap::new(&buffer_snapshot);
+        let (inlay_map, snapshot) = InlayMap::new(buffer_snapshot);
         let (fold_map, snapshot) = FoldMap::new(snapshot);
         let (tab_map, snapshot) = TabMap::new(snapshot, tab_size);
         let (wrap_map, snapshot) = WrapMap::new(snapshot, font, font_size, wrap_width, cx);
@@ -140,7 +144,6 @@ impl DisplayMap {
             excerpt_header_height,
             excerpt_footer_height,
         );
-        let crease_map = CreaseMap::default();
 
         cx.observe(&wrap_map, |_, _, cx| cx.notify()).detach();
 
@@ -286,44 +289,11 @@ impl DisplayMap {
         block_map.insert(blocks)
     }
 
-    pub fn replace_blocks(
+    pub fn resize_blocks(
         &mut self,
-        heights_and_renderers: HashMap<CustomBlockId, (Option<u8>, RenderBlock)>,
+        heights: HashMap<CustomBlockId, u32>,
         cx: &mut ModelContext<Self>,
     ) {
-        //
-        // Note: previous implementation of `replace_blocks` simply called
-        // `self.block_map.replace(styles)` which just modified the render by replacing
-        // the `RenderBlock` with the new one.
-        //
-        // ```rust
-        //  for block in &self.blocks {
-        //           if let Some(render) = renderers.remove(&block.id) {
-        //               *block.render.lock() = render;
-        //           }
-        //       }
-        // ```
-        //
-        // If height changes however, we need to update the tree. There's a performance
-        // cost to this, so we'll split the replace blocks into handling the old behavior
-        // directly and the new behavior separately.
-        //
-        //
-        let mut only_renderers = HashMap::<CustomBlockId, RenderBlock>::default();
-        let mut full_replace = HashMap::<CustomBlockId, (u8, RenderBlock)>::default();
-        for (id, (height, render)) in heights_and_renderers {
-            if let Some(height) = height {
-                full_replace.insert(id, (height, render));
-            } else {
-                only_renderers.insert(id, render);
-            }
-        }
-        self.block_map.replace_renderers(only_renderers);
-
-        if full_replace.is_empty() {
-            return;
-        }
-
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let edits = self.buffer_subscription.consume().into_inner();
         let tab_size = Self::tab_size(&self.buffer, cx);
@@ -334,7 +304,11 @@ impl DisplayMap {
             .wrap_map
             .update(cx, |map, cx| map.sync(snapshot, edits, cx));
         let mut block_map = self.block_map.write(snapshot, edits);
-        block_map.replace(full_replace);
+        block_map.resize(heights);
+    }
+
+    pub fn replace_blocks(&mut self, renderers: HashMap<CustomBlockId, RenderBlock>) {
+        self.block_map.replace_blocks(renderers);
     }
 
     pub fn remove_blocks(&mut self, ids: HashSet<CustomBlockId>, cx: &mut ModelContext<Self>) {
@@ -453,11 +427,12 @@ impl DisplayMap {
     }
 
     fn tab_size(buffer: &Model<MultiBuffer>, cx: &mut ModelContext<Self>) -> NonZeroU32 {
+        let buffer = buffer.read(cx).as_singleton().map(|buffer| buffer.read(cx));
         let language = buffer
-            .read(cx)
-            .as_singleton()
-            .and_then(|buffer| buffer.read(cx).language());
-        language_settings(language, None, cx).tab_size
+            .and_then(|buffer| buffer.language())
+            .map(|l| l.name());
+        let file = buffer.and_then(|buffer| buffer.file());
+        language_settings(language, file, cx).tab_size
     }
 
     #[cfg(test)]
@@ -488,6 +463,98 @@ pub struct HighlightedChunk<'a> {
     pub style: Option<HighlightStyle>,
     pub is_tab: bool,
     pub renderer: Option<ChunkRenderer>,
+}
+
+impl<'a> HighlightedChunk<'a> {
+    fn highlight_invisibles(
+        self,
+        editor_style: &'a EditorStyle,
+    ) -> impl Iterator<Item = Self> + 'a {
+        let mut chars = self.text.chars().peekable();
+        let mut text = self.text;
+        let style = self.style;
+        let is_tab = self.is_tab;
+        let renderer = self.renderer;
+        iter::from_fn(move || {
+            let mut prefix_len = 0;
+            while let Some(&ch) = chars.peek() {
+                if !is_invisible(ch) {
+                    prefix_len += ch.len_utf8();
+                    chars.next();
+                    continue;
+                }
+                if prefix_len > 0 {
+                    let (prefix, suffix) = text.split_at(prefix_len);
+                    text = suffix;
+                    return Some(HighlightedChunk {
+                        text: prefix,
+                        style,
+                        is_tab,
+                        renderer: renderer.clone(),
+                    });
+                }
+                chars.next();
+                let (prefix, suffix) = text.split_at(ch.len_utf8());
+                text = suffix;
+                if let Some(replacement) = replacement(ch) {
+                    let background = editor_style.status.hint_background;
+                    let underline = editor_style.status.hint;
+                    return Some(HighlightedChunk {
+                        text: prefix,
+                        style: None,
+                        is_tab: false,
+                        renderer: Some(ChunkRenderer {
+                            render: Arc::new(move |_| {
+                                div()
+                                    .child(replacement)
+                                    .bg(background)
+                                    .text_decoration_1()
+                                    .text_decoration_color(underline)
+                                    .into_any_element()
+                            }),
+                            constrain_width: false,
+                        }),
+                    });
+                } else {
+                    let invisible_highlight = HighlightStyle {
+                        background_color: Some(editor_style.status.hint_background),
+                        underline: Some(UnderlineStyle {
+                            color: Some(editor_style.status.hint),
+                            thickness: px(1.),
+                            wavy: false,
+                        }),
+                        ..Default::default()
+                    };
+                    let invisible_style = if let Some(mut style) = style {
+                        style.highlight(invisible_highlight);
+                        style
+                    } else {
+                        invisible_highlight
+                    };
+
+                    return Some(HighlightedChunk {
+                        text: prefix,
+                        style: Some(invisible_style),
+                        is_tab: false,
+                        renderer: renderer.clone(),
+                    });
+                }
+            }
+
+            if !text.is_empty() {
+                let remainder = text;
+                text = "";
+                Some(HighlightedChunk {
+                    text: remainder,
+                    style,
+                    is_tab,
+                    renderer: renderer.clone(),
+                })
+            } else {
+                None
+            }
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -593,7 +660,7 @@ impl DisplaySnapshot {
         new_start..new_end
     }
 
-    fn point_to_display_point(&self, point: MultiBufferPoint, bias: Bias) -> DisplayPoint {
+    pub fn point_to_display_point(&self, point: MultiBufferPoint, bias: Bias) -> DisplayPoint {
         let inlay_point = self.inlay_snapshot.to_inlay_point(point);
         let fold_point = self.fold_snapshot.to_fold_point(inlay_point, bias);
         let tab_point = self.tab_snapshot.to_tab_point(fold_point);
@@ -602,7 +669,7 @@ impl DisplaySnapshot {
         DisplayPoint(block_point)
     }
 
-    fn display_point_to_point(&self, point: DisplayPoint, bias: Bias) -> Point {
+    pub fn display_point_to_point(&self, point: DisplayPoint, bias: Bias) -> Point {
         self.inlay_snapshot
             .to_buffer_point(self.display_point_to_inlay_point(point, bias))
     }
@@ -619,12 +686,12 @@ impl DisplaySnapshot {
 
     pub fn display_point_to_anchor(&self, point: DisplayPoint, bias: Bias) -> Anchor {
         self.buffer_snapshot
-            .anchor_at(point.to_offset(&self, bias), bias)
+            .anchor_at(point.to_offset(self, bias), bias)
     }
 
     fn display_point_to_inlay_point(&self, point: DisplayPoint, bias: Bias) -> InlayPoint {
         let block_point = point.0;
-        let wrap_point = self.block_snapshot.to_wrap_point(block_point);
+        let wrap_point = self.block_snapshot.to_wrap_point(block_point, bias);
         let tab_point = self.wrap_snapshot.to_tab_point(wrap_point);
         let fold_point = self.tab_snapshot.to_fold_point(tab_point, bias).0;
         fold_point.to_inlay_point(&self.fold_snapshot)
@@ -632,7 +699,7 @@ impl DisplaySnapshot {
 
     pub fn display_point_to_fold_point(&self, point: DisplayPoint, bias: Bias) -> FoldPoint {
         let block_point = point.0;
-        let wrap_point = self.block_snapshot.to_wrap_point(block_point);
+        let wrap_point = self.block_snapshot.to_wrap_point(block_point, bias);
         let tab_point = self.wrap_snapshot.to_tab_point(wrap_point);
         self.tab_snapshot.to_fold_point(tab_point, bias).0
     }
@@ -704,7 +771,7 @@ impl DisplaySnapshot {
                 suggestion: Some(editor_style.suggestions_style),
             },
         )
-        .map(|chunk| {
+        .flat_map(|chunk| {
             let mut highlight_style = chunk
                 .syntax_highlight_id
                 .and_then(|id| id.style(&editor_style.syntax));
@@ -720,7 +787,7 @@ impl DisplaySnapshot {
             let mut diagnostic_highlight = HighlightStyle::default();
 
             if chunk.is_unnecessary {
-                diagnostic_highlight.fade_out = Some(UNNECESSARY_CODE_FADE);
+                diagnostic_highlight.fade_out = Some(editor_style.unnecessary_code_fade);
             }
 
             if let Some(severity) = chunk.diagnostic_severity {
@@ -747,6 +814,7 @@ impl DisplaySnapshot {
                 is_tab: chunk.is_tab,
                 renderer: chunk.renderer,
             }
+            .highlight_invisibles(editor_style)
         })
     }
 
@@ -766,7 +834,7 @@ impl DisplaySnapshot {
         let mut line = String::new();
 
         let range = display_row..display_row.next_row();
-        for chunk in self.highlighted_chunks(range, false, &editor_style) {
+        for chunk in self.highlighted_chunks(range, false, editor_style) {
             line.push_str(chunk.text);
 
             let text_style = if let Some(style) = chunk.style {
@@ -813,12 +881,10 @@ impl DisplaySnapshot {
         layout_line.closest_index_for_x(x) as u32
     }
 
-    pub fn display_chars_at(
-        &self,
-        mut point: DisplayPoint,
-    ) -> impl Iterator<Item = (char, DisplayPoint)> + '_ {
+    pub fn grapheme_at(&self, mut point: DisplayPoint) -> Option<SharedString> {
         point = DisplayPoint(self.block_snapshot.clip_point(point.0, Bias::Left));
-        self.text_chunks(point.row())
+        let chars = self
+            .text_chunks(point.row())
             .flat_map(str::chars)
             .skip_while({
                 let mut column = 0;
@@ -828,16 +894,24 @@ impl DisplaySnapshot {
                     !at_point
                 }
             })
-            .map(move |ch| {
-                let result = (ch, point);
-                if ch == '\n' {
-                    *point.row_mut() += 1;
-                    *point.column_mut() = 0;
-                } else {
-                    *point.column_mut() += ch.len_utf8() as u32;
+            .take_while({
+                let mut prev = false;
+                move |char| {
+                    let now = char.is_ascii();
+                    let end = char.is_ascii() && (char.is_ascii_whitespace() || prev);
+                    prev = now;
+                    !end
                 }
-                result
-            })
+            });
+        chars.collect::<String>().graphemes(true).next().map(|s| {
+            if let Some(invisible) = s.chars().next().filter(|&c| is_invisible(c)) {
+                replacement(invisible).unwrap_or(s).to_owned().into()
+            } else if s == "\n" {
+                " ".into()
+            } else {
+                s.to_owned().into()
+            }
+        })
     }
 
     pub fn buffer_chars_at(&self, mut offset: usize) -> impl Iterator<Item = (char, usize)> + '_ {
@@ -916,7 +990,7 @@ impl DisplaySnapshot {
     pub fn soft_wrap_indent(&self, display_row: DisplayRow) -> Option<u32> {
         let wrap_row = self
             .block_snapshot
-            .to_wrap_point(BlockPoint::new(display_row.0, 0))
+            .to_wrap_point(BlockPoint::new(display_row.0, 0), Bias::Left)
             .row();
         self.wrap_snapshot.soft_wrap_indent(wrap_row)
     }
@@ -1051,6 +1125,18 @@ impl DisplaySnapshot {
         let type_id = TypeId::of::<Tag>();
         self.inlay_highlights.get(&type_id)
     }
+
+    pub fn buffer_header_height(&self) -> u32 {
+        self.block_snapshot.buffer_header_height
+    }
+
+    pub fn excerpt_footer_height(&self) -> u32 {
+        self.block_snapshot.excerpt_footer_height
+    }
+
+    pub fn excerpt_header_height(&self) -> u32 {
+        self.block_snapshot.excerpt_header_height
+    }
 }
 
 #[derive(Copy, Clone, Default, Eq, Ord, PartialOrd, PartialEq)]
@@ -1086,7 +1172,7 @@ impl Sub for DisplayPoint {
 #[serde(transparent)]
 pub struct DisplayRow(pub u32);
 
-impl Add for DisplayRow {
+impl Add<DisplayRow> for DisplayRow {
     type Output = Self;
 
     fn add(self, other: Self) -> Self::Output {
@@ -1094,11 +1180,27 @@ impl Add for DisplayRow {
     }
 }
 
-impl Sub for DisplayRow {
+impl Add<u32> for DisplayRow {
+    type Output = Self;
+
+    fn add(self, other: u32) -> Self::Output {
+        DisplayRow(self.0 + other)
+    }
+}
+
+impl Sub<DisplayRow> for DisplayRow {
     type Output = Self;
 
     fn sub(self, other: Self) -> Self::Output {
         DisplayRow(self.0 - other.0)
+    }
+}
+
+impl Sub<u32> for DisplayRow {
+    type Output = Self;
+
+    fn sub(self, other: u32) -> Self::Output {
+        DisplayRow(self.0 - other)
     }
 }
 
@@ -1136,7 +1238,7 @@ impl DisplayPoint {
     }
 
     pub fn to_offset(self, map: &DisplaySnapshot, bias: Bias) -> usize {
-        let wrap_point = map.block_snapshot.to_wrap_point(self.0);
+        let wrap_point = map.block_snapshot.to_wrap_point(self.0, bias);
         let tab_point = map.wrap_snapshot.to_tab_point(wrap_point);
         let fold_point = map.tab_snapshot.to_fold_point(tab_point, bias).0;
         let inlay_point = fold_point.to_inlay_point(&map.fold_snapshot);
@@ -1173,17 +1275,24 @@ impl ToDisplayPoint for Anchor {
 pub mod tests {
     use super::*;
     use crate::{movement, test::marked_display_snapshot};
-    use gpui::{div, font, observe, px, AppContext, BorrowAppContext, Context, Element, Hsla};
+    use block_map::BlockPlacement;
+    use gpui::{
+        div, font, observe, px, AppContext, BorrowAppContext, Context, Element, Hsla, Rgba,
+    };
     use language::{
         language_settings::{AllLanguageSettings, AllLanguageSettingsContent},
-        Buffer, Language, LanguageConfig, LanguageMatcher,
+        Buffer, Diagnostic, DiagnosticEntry, DiagnosticSet, Language, LanguageConfig,
+        LanguageMatcher,
     };
+    use lsp::LanguageServerId;
     use project::Project;
     use rand::{prelude::*, Rng};
     use settings::SettingsStore;
     use smol::stream::StreamExt;
     use std::{env, sync::Arc};
+    use text::PointUtf16;
     use theme::{LoadThemes, SyntaxTheme};
+    use unindent::Unindent as _;
     use util::test::{marked_text_ranges, sample_text};
     use Bias::*;
 
@@ -1286,24 +1395,24 @@ pub mod tests {
                                             Bias::Left,
                                         ));
 
-                                    let disposition = if rng.gen() {
-                                        BlockDisposition::Above
+                                    let placement = if rng.gen() {
+                                        BlockPlacement::Above(position)
                                     } else {
-                                        BlockDisposition::Below
+                                        BlockPlacement::Below(position)
                                     };
                                     let height = rng.gen_range(1..5);
                                     log::info!(
-                                        "inserting block {:?} {:?} with height {}",
-                                        disposition,
-                                        position.to_point(&buffer),
+                                        "inserting block {:?} with height {}",
+                                        placement.as_ref().map(|p| p.to_point(&buffer)),
                                         height
                                     );
+                                    let priority = rng.gen_range(1..100);
                                     BlockProperties {
+                                        placement,
                                         style: BlockStyle::Fixed,
-                                        position,
                                         height,
-                                        disposition,
                                         render: Box::new(|_| div().into_any()),
+                                        priority,
                                     }
                                 })
                                 .collect::<Vec<_>>();
@@ -1640,8 +1749,6 @@ pub mod tests {
 
     #[gpui::test]
     async fn test_chunks(cx: &mut gpui::TestAppContext) {
-        use unindent::Unindent as _;
-
         let text = r#"
             fn outer() {}
 
@@ -1662,7 +1769,7 @@ pub mod tests {
                     },
                     ..Default::default()
                 },
-                Some(tree_sitter_rust::language()),
+                Some(tree_sitter_rust::LANGUAGE.into()),
             )
             .with_highlights_query(
                 r#"
@@ -1738,12 +1845,335 @@ pub mod tests {
         );
     }
 
+    #[gpui::test]
+    async fn test_chunks_with_syntax_highlighting_across_blocks(cx: &mut gpui::TestAppContext) {
+        cx.background_executor
+            .set_block_on_ticks(usize::MAX..=usize::MAX);
+
+        let text = r#"
+            const A: &str = "
+                one
+                two
+                three
+            ";
+            const B: &str = "four";
+        "#
+        .unindent();
+
+        let theme = SyntaxTheme::new_test(vec![
+            ("string", Hsla::red()),
+            ("punctuation", Hsla::blue()),
+            ("keyword", Hsla::green()),
+        ]);
+        let language = Arc::new(
+            Language::new(
+                LanguageConfig {
+                    name: "Rust".into(),
+                    ..Default::default()
+                },
+                Some(tree_sitter_rust::LANGUAGE.into()),
+            )
+            .with_highlights_query(
+                r#"
+                (string_literal) @string
+                "const" @keyword
+                [":" ";"] @punctuation
+                "#,
+            )
+            .unwrap(),
+        );
+        language.set_theme(&theme);
+
+        cx.update(|cx| init_test(cx, |_| {}));
+
+        let buffer = cx.new_model(|cx| Buffer::local(text, cx).with_language(language, cx));
+        cx.condition(&buffer, |buf, _| !buf.is_parsing()).await;
+        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+
+        let map = cx.new_model(|cx| {
+            DisplayMap::new(
+                buffer,
+                font("Courier"),
+                px(16.0),
+                None,
+                true,
+                1,
+                1,
+                0,
+                FoldPlaceholder::test(),
+                cx,
+            )
+        });
+
+        // Insert a block in the middle of a multi-line string literal
+        map.update(cx, |map, cx| {
+            map.insert_blocks(
+                [BlockProperties {
+                    placement: BlockPlacement::Below(
+                        buffer_snapshot.anchor_before(Point::new(1, 0)),
+                    ),
+                    height: 1,
+                    style: BlockStyle::Sticky,
+                    render: Box::new(|_| div().into_any()),
+                    priority: 0,
+                }],
+                cx,
+            )
+        });
+
+        pretty_assertions::assert_eq!(
+            cx.update(|cx| syntax_chunks(DisplayRow(0)..DisplayRow(7), &map, &theme, cx)),
+            [
+                ("const".into(), Some(Hsla::green())),
+                (" A".into(), None),
+                (":".into(), Some(Hsla::blue())),
+                (" &str = ".into(), None),
+                ("\"\n    one\n".into(), Some(Hsla::red())),
+                ("\n".into(), None),
+                ("    two\n    three\n\"".into(), Some(Hsla::red())),
+                (";".into(), Some(Hsla::blue())),
+                ("\n".into(), None),
+                ("const".into(), Some(Hsla::green())),
+                (" B".into(), None),
+                (":".into(), Some(Hsla::blue())),
+                (" &str = ".into(), None),
+                ("\"four\"".into(), Some(Hsla::red())),
+                (";".into(), Some(Hsla::blue())),
+                ("\n".into(), None),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_chunks_with_diagnostics_across_blocks(cx: &mut gpui::TestAppContext) {
+        cx.background_executor
+            .set_block_on_ticks(usize::MAX..=usize::MAX);
+
+        let text = r#"
+            struct A {
+                b: usize;
+            }
+            const c: usize = 1;
+        "#
+        .unindent();
+
+        cx.update(|cx| init_test(cx, |_| {}));
+
+        let buffer = cx.new_model(|cx| Buffer::local(text, cx));
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.update_diagnostics(
+                LanguageServerId(0),
+                DiagnosticSet::new(
+                    [DiagnosticEntry {
+                        range: PointUtf16::new(0, 0)..PointUtf16::new(2, 1),
+                        diagnostic: Diagnostic {
+                            severity: DiagnosticSeverity::ERROR,
+                            group_id: 1,
+                            message: "hi".into(),
+                            ..Default::default()
+                        },
+                    }],
+                    buffer,
+                ),
+                cx,
+            )
+        });
+
+        let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+
+        let map = cx.new_model(|cx| {
+            DisplayMap::new(
+                buffer,
+                font("Courier"),
+                px(16.0),
+                None,
+                true,
+                1,
+                1,
+                0,
+                FoldPlaceholder::test(),
+                cx,
+            )
+        });
+
+        let black = gpui::black().to_rgb();
+        let red = gpui::red().to_rgb();
+
+        // Insert a block in the middle of a multi-line diagnostic.
+        map.update(cx, |map, cx| {
+            map.highlight_text(
+                TypeId::of::<usize>(),
+                vec![
+                    buffer_snapshot.anchor_before(Point::new(3, 9))
+                        ..buffer_snapshot.anchor_after(Point::new(3, 14)),
+                    buffer_snapshot.anchor_before(Point::new(3, 17))
+                        ..buffer_snapshot.anchor_after(Point::new(3, 18)),
+                ],
+                red.into(),
+            );
+            map.insert_blocks(
+                [BlockProperties {
+                    placement: BlockPlacement::Below(
+                        buffer_snapshot.anchor_before(Point::new(1, 0)),
+                    ),
+                    height: 1,
+                    style: BlockStyle::Sticky,
+                    render: Box::new(|_| div().into_any()),
+                    priority: 0,
+                }],
+                cx,
+            )
+        });
+
+        let snapshot = map.update(cx, |map, cx| map.snapshot(cx));
+        let mut chunks = Vec::<(String, Option<DiagnosticSeverity>, Rgba)>::new();
+        for chunk in snapshot.chunks(DisplayRow(0)..DisplayRow(5), true, Default::default()) {
+            let color = chunk
+                .highlight_style
+                .and_then(|style| style.color)
+                .map_or(black, |color| color.to_rgb());
+            if let Some((last_chunk, last_severity, last_color)) = chunks.last_mut() {
+                if *last_severity == chunk.diagnostic_severity && *last_color == color {
+                    last_chunk.push_str(chunk.text);
+                    continue;
+                }
+            }
+
+            chunks.push((chunk.text.to_string(), chunk.diagnostic_severity, color));
+        }
+
+        assert_eq!(
+            chunks,
+            [
+                (
+                    "struct A {\n    b: usize;\n".into(),
+                    Some(DiagnosticSeverity::ERROR),
+                    black
+                ),
+                ("\n".into(), None, black),
+                ("}".into(), Some(DiagnosticSeverity::ERROR), black),
+                ("\nconst c: ".into(), None, black),
+                ("usize".into(), None, red),
+                (" = ".into(), None, black),
+                ("1".into(), None, red),
+                (";\n".into(), None, black),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    async fn test_point_translation_with_replace_blocks(cx: &mut gpui::TestAppContext) {
+        cx.background_executor
+            .set_block_on_ticks(usize::MAX..=usize::MAX);
+
+        cx.update(|cx| init_test(cx, |_| {}));
+
+        let buffer = cx.update(|cx| MultiBuffer::build_simple("abcde\nfghij\nklmno\npqrst", cx));
+        let buffer_snapshot = buffer.read_with(cx, |buffer, cx| buffer.snapshot(cx));
+        let map = cx.new_model(|cx| {
+            DisplayMap::new(
+                buffer.clone(),
+                font("Courier"),
+                px(16.0),
+                None,
+                true,
+                1,
+                1,
+                0,
+                FoldPlaceholder::test(),
+                cx,
+            )
+        });
+
+        let snapshot = map.update(cx, |map, cx| {
+            map.insert_blocks(
+                [BlockProperties {
+                    placement: BlockPlacement::Replace(
+                        buffer_snapshot.anchor_before(Point::new(1, 2))
+                            ..buffer_snapshot.anchor_after(Point::new(2, 3)),
+                    ),
+                    height: 4,
+                    style: BlockStyle::Fixed,
+                    render: Box::new(|_| div().into_any()),
+                    priority: 0,
+                }],
+                cx,
+            );
+            map.snapshot(cx)
+        });
+
+        assert_eq!(snapshot.text(), "abcde\n\n\n\n\npqrst");
+
+        let point_to_display_points = [
+            (Point::new(1, 0), DisplayPoint::new(DisplayRow(1), 0)),
+            (Point::new(2, 0), DisplayPoint::new(DisplayRow(1), 0)),
+            (Point::new(3, 0), DisplayPoint::new(DisplayRow(5), 0)),
+        ];
+        for (buffer_point, display_point) in point_to_display_points {
+            assert_eq!(
+                snapshot.point_to_display_point(buffer_point, Bias::Left),
+                display_point,
+                "point_to_display_point({:?}, Bias::Left)",
+                buffer_point
+            );
+            assert_eq!(
+                snapshot.point_to_display_point(buffer_point, Bias::Right),
+                display_point,
+                "point_to_display_point({:?}, Bias::Right)",
+                buffer_point
+            );
+        }
+
+        let display_points_to_points = [
+            (
+                DisplayPoint::new(DisplayRow(1), 0),
+                Point::new(1, 0),
+                Point::new(2, 5),
+            ),
+            (
+                DisplayPoint::new(DisplayRow(2), 0),
+                Point::new(1, 0),
+                Point::new(2, 5),
+            ),
+            (
+                DisplayPoint::new(DisplayRow(3), 0),
+                Point::new(1, 0),
+                Point::new(2, 5),
+            ),
+            (
+                DisplayPoint::new(DisplayRow(4), 0),
+                Point::new(1, 0),
+                Point::new(2, 5),
+            ),
+            (
+                DisplayPoint::new(DisplayRow(5), 0),
+                Point::new(3, 0),
+                Point::new(3, 0),
+            ),
+        ];
+        for (display_point, left_buffer_point, right_buffer_point) in display_points_to_points {
+            assert_eq!(
+                snapshot.display_point_to_point(display_point, Bias::Left),
+                left_buffer_point,
+                "display_point_to_point({:?}, Bias::Left)",
+                display_point
+            );
+            assert_eq!(
+                snapshot.display_point_to_point(display_point, Bias::Right),
+                right_buffer_point,
+                "display_point_to_point({:?}, Bias::Right)",
+                display_point
+            );
+        }
+    }
+
     // todo(linux) fails due to pixel differences in text rendering
     #[cfg(target_os = "macos")]
     #[gpui::test]
     async fn test_chunks_with_soft_wrapping(cx: &mut gpui::TestAppContext) {
-        use unindent::Unindent as _;
-
         cx.background_executor
             .set_block_on_ticks(usize::MAX..=usize::MAX);
 
@@ -1767,7 +2197,7 @@ pub mod tests {
                     },
                     ..Default::default()
                 },
-                Some(tree_sitter_rust::language()),
+                Some(tree_sitter_rust::LANGUAGE.into()),
             )
             .with_highlights_query(
                 r#"
@@ -1850,7 +2280,7 @@ pub mod tests {
                     },
                     ..Default::default()
                 },
-                Some(tree_sitter_rust::language()),
+                Some(tree_sitter_rust::LANGUAGE.into()),
             )
             .with_highlights_query(
                 r#"

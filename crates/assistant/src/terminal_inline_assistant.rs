@@ -1,6 +1,6 @@
 use crate::{
-    humanize_token_count, prompts::generate_terminal_assistant_prompt, AssistantPanel,
-    AssistantPanelEvent, LanguageModelCompletionProvider, ModelSelector,
+    humanize_token_count, prompts::PromptBuilder, AssistantPanel, AssistantPanelEvent,
+    ModelSelector, RequestType, DEFAULT_CONTEXT_LINES,
 };
 use anyhow::{Context as _, Result};
 use client::telemetry::Telemetry;
@@ -16,13 +16,17 @@ use gpui::{
     Subscription, Task, TextStyle, UpdateGlobal, View, WeakView,
 };
 use language::Buffer;
-use language_model::{LanguageModelRequest, LanguageModelRequestMessage, Role};
+use language_model::{
+    logging::report_assistant_event, LanguageModelRegistry, LanguageModelRequest,
+    LanguageModelRequestMessage, Role,
+};
 use settings::Settings;
 use std::{
     cmp,
     sync::Arc,
     time::{Duration, Instant},
 };
+use telemetry_events::{AssistantEvent, AssistantKind, AssistantPhase};
 use terminal::Terminal;
 use terminal_view::TerminalView;
 use theme::ThemeSettings;
@@ -30,8 +34,13 @@ use ui::{prelude::*, IconButtonShape, Tooltip};
 use util::ResultExt;
 use workspace::{notifications::NotificationId, Toast, Workspace};
 
-pub fn init(fs: Arc<dyn Fs>, telemetry: Arc<Telemetry>, cx: &mut AppContext) {
-    cx.set_global(TerminalInlineAssistant::new(fs, telemetry));
+pub fn init(
+    fs: Arc<dyn Fs>,
+    prompt_builder: Arc<PromptBuilder>,
+    telemetry: Arc<Telemetry>,
+    cx: &mut AppContext,
+) {
+    cx.set_global(TerminalInlineAssistant::new(fs, prompt_builder, telemetry));
 }
 
 const PROMPT_HISTORY_MAX_LEN: usize = 20;
@@ -53,18 +62,24 @@ pub struct TerminalInlineAssistant {
     prompt_history: VecDeque<String>,
     telemetry: Option<Arc<Telemetry>>,
     fs: Arc<dyn Fs>,
+    prompt_builder: Arc<PromptBuilder>,
 }
 
 impl Global for TerminalInlineAssistant {}
 
 impl TerminalInlineAssistant {
-    pub fn new(fs: Arc<dyn Fs>, telemetry: Arc<Telemetry>) -> Self {
+    pub fn new(
+        fs: Arc<dyn Fs>,
+        prompt_builder: Arc<PromptBuilder>,
+        telemetry: Arc<Telemetry>,
+    ) -> Self {
         Self {
             next_assist_id: TerminalInlineAssistId::default(),
             assists: HashMap::default(),
             prompt_history: VecDeque::default(),
             telemetry: Some(telemetry),
             fs,
+            prompt_builder,
         }
     }
 
@@ -144,11 +159,11 @@ impl TerminalInlineAssistant {
             PromptEditorEvent::StopRequested => {
                 self.stop_assist(assist_id, cx);
             }
-            PromptEditorEvent::ConfirmRequested => {
-                self.finish_assist(assist_id, false, cx);
+            PromptEditorEvent::ConfirmRequested { execute } => {
+                self.finish_assist(assist_id, false, *execute, cx);
             }
             PromptEditorEvent::CancelRequested => {
-                self.finish_assist(assist_id, true, cx);
+                self.finish_assist(assist_id, true, false, cx);
             }
             PromptEditorEvent::DismissRequested => {
                 self.dismiss_assist(assist_id, cx);
@@ -215,17 +230,18 @@ impl TerminalInlineAssistant {
         let assist = self.assists.get(&assist_id).context("invalid assist")?;
 
         let shell = std::env::var("SHELL").ok();
-        let working_directory = assist
+        let (latest_output, working_directory) = assist
             .terminal
             .update(cx, |terminal, cx| {
-                terminal
-                    .model()
-                    .read(cx)
+                let terminal = terminal.model().read(cx);
+                let latest_output = terminal.last_n_non_empty_lines(DEFAULT_CONTEXT_LINES);
+                let working_directory = terminal
                     .working_directory()
-                    .map(|path| path.to_string_lossy().to_string())
+                    .map(|path| path.to_string_lossy().to_string());
+                (latest_output, working_directory)
             })
             .ok()
-            .flatten();
+            .unwrap_or_default();
 
         let context_request = if assist.include_context {
             assist.workspace.as_ref().and_then(|workspace| {
@@ -236,14 +252,14 @@ impl TerminalInlineAssistant {
                         .read(cx)
                         .active_context(cx)?
                         .read(cx)
-                        .to_completion_request(cx),
+                        .to_completion_request(RequestType::Chat, cx),
                 )
             })
         } else {
             None
         };
 
-        let prompt = generate_terminal_assistant_prompt(
+        let prompt = self.prompt_builder.generate_terminal_assistant_prompt(
             &assist
                 .prompt_editor
                 .clone()
@@ -252,7 +268,8 @@ impl TerminalInlineAssistant {
                 .prompt(cx),
             shell.as_deref(),
             working_directory.as_deref(),
-        );
+            &latest_output,
+        )?;
 
         let mut messages = Vec::new();
         if let Some(context_request) = context_request {
@@ -261,13 +278,15 @@ impl TerminalInlineAssistant {
 
         messages.push(LanguageModelRequestMessage {
             role: Role::User,
-            content: prompt,
+            content: vec![prompt.into()],
+            cache: false,
         });
 
         Ok(LanguageModelRequest {
             messages,
+            tools: Vec::new(),
             stop: Vec::new(),
-            temperature: 1.0,
+            temperature: None,
         })
     }
 
@@ -275,6 +294,7 @@ impl TerminalInlineAssistant {
         &mut self,
         assist_id: TerminalInlineAssistId,
         undo: bool,
+        execute: bool,
         cx: &mut WindowContext,
     ) {
         self.dismiss_assist(assist_id, cx);
@@ -287,10 +307,37 @@ impl TerminalInlineAssistant {
                     this.focus_handle(cx).focus(cx);
                 })
                 .log_err();
+
+            if let Some(model) = LanguageModelRegistry::read_global(cx).active_model() {
+                let codegen = assist.codegen.read(cx);
+                let executor = cx.background_executor().clone();
+                report_assistant_event(
+                    AssistantEvent {
+                        conversation_id: None,
+                        kind: AssistantKind::InlineTerminal,
+                        message_id: codegen.message_id.clone(),
+                        phase: if undo {
+                            AssistantPhase::Rejected
+                        } else {
+                            AssistantPhase::Accepted
+                        },
+                        model: model.telemetry_id(),
+                        model_provider: model.provider_id().to_string(),
+                        response_latency: None,
+                        error_message: None,
+                        language_name: None,
+                    },
+                    codegen.telemetry.clone(),
+                    cx.http_client(),
+                    model.api_key(cx),
+                    &executor,
+                );
+            }
+
             assist.codegen.update(cx, |codegen, cx| {
                 if undo {
                     codegen.undo(cx);
-                } else {
+                } else if execute {
                     codegen.complete(cx);
                 }
             });
@@ -395,7 +442,7 @@ impl TerminalInlineAssist {
                                             struct InlineAssistantError;
 
                                             let id =
-                                                NotificationId::identified::<InlineAssistantError>(
+                                                NotificationId::composite::<InlineAssistantError>(
                                                     assist_id.0,
                                                 );
 
@@ -406,7 +453,7 @@ impl TerminalInlineAssist {
                             }
 
                             if assist.prompt_editor.is_none() {
-                                this.finish_assist(assist_id, false, cx);
+                                this.finish_assist(assist_id, false, false, cx);
                             }
                         }
                     })
@@ -419,7 +466,7 @@ impl TerminalInlineAssist {
 enum PromptEditorEvent {
     StartRequested,
     StopRequested,
-    ConfirmRequested,
+    ConfirmRequested { execute: bool },
     CancelRequested,
     DismissRequested,
     Resized { height_in_lines: u8 },
@@ -447,7 +494,8 @@ impl EventEmitter<PromptEditorEvent> for PromptEditor {}
 
 impl Render for PromptEditor {
     fn render(&mut self, cx: &mut ViewContext<Self>) -> impl IntoElement {
-        let buttons = match &self.codegen.read(cx).status {
+        let status = &self.codegen.read(cx).status;
+        let buttons = match status {
             CodegenStatus::Idle => {
                 vec![
                     IconButton::new("cancel", IconName::Close)
@@ -492,15 +540,16 @@ impl Render for PromptEditor {
                 ]
             }
             CodegenStatus::Error(_) | CodegenStatus::Done => {
-                vec![
-                    IconButton::new("cancel", IconName::Close)
-                        .icon_color(Color::Muted)
-                        .shape(IconButtonShape::Square)
-                        .tooltip(|cx| Tooltip::for_action("Cancel Assist", &menu::Cancel, cx))
-                        .on_click(
-                            cx.listener(|_, _, cx| cx.emit(PromptEditorEvent::CancelRequested)),
-                        ),
-                    if self.edited_since_done {
+                let cancel = IconButton::new("cancel", IconName::Close)
+                    .icon_color(Color::Muted)
+                    .shape(IconButtonShape::Square)
+                    .tooltip(|cx| Tooltip::for_action("Cancel Assist", &menu::Cancel, cx))
+                    .on_click(cx.listener(|_, _, cx| cx.emit(PromptEditorEvent::CancelRequested)));
+
+                let has_error = matches!(status, CodegenStatus::Error(_));
+                if has_error || self.edited_since_done {
+                    vec![
+                        cancel,
                         IconButton::new("restart", IconName::RotateCw)
                             .icon_color(Color::Info)
                             .shape(IconButtonShape::Square)
@@ -514,19 +563,35 @@ impl Render for PromptEditor {
                             })
                             .on_click(cx.listener(|_, _, cx| {
                                 cx.emit(PromptEditorEvent::StartRequested);
-                            }))
-                    } else {
+                            })),
+                    ]
+                } else {
+                    vec![
+                        cancel,
+                        IconButton::new("accept", IconName::Check)
+                            .icon_color(Color::Info)
+                            .shape(IconButtonShape::Square)
+                            .tooltip(|cx| {
+                                Tooltip::for_action("Accept Generated Command", &menu::Confirm, cx)
+                            })
+                            .on_click(cx.listener(|_, _, cx| {
+                                cx.emit(PromptEditorEvent::ConfirmRequested { execute: false });
+                            })),
                         IconButton::new("confirm", IconName::Play)
                             .icon_color(Color::Info)
                             .shape(IconButtonShape::Square)
                             .tooltip(|cx| {
-                                Tooltip::for_action("Execute generated command", &menu::Confirm, cx)
+                                Tooltip::for_action(
+                                    "Execute Generated Command",
+                                    &menu::SecondaryConfirm,
+                                    cx,
+                                )
                             })
                             .on_click(cx.listener(|_, _, cx| {
-                                cx.emit(PromptEditorEvent::ConfirmRequested);
-                            }))
-                    },
-                ]
+                                cx.emit(PromptEditorEvent::ConfirmRequested { execute: true });
+                            })),
+                    ]
+                }
             }
         };
 
@@ -534,10 +599,11 @@ impl Render for PromptEditor {
             .bg(cx.theme().colors().editor_background)
             .border_y_1()
             .border_color(cx.theme().status().info_border)
-            .py_1p5()
+            .py_2()
             .h_full()
             .w_full()
             .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::secondary_confirm))
             .on_action(cx.listener(Self::cancel))
             .on_action(cx.listener(Self::move_up))
             .on_action(cx.listener(Self::move_down))
@@ -548,7 +614,7 @@ impl Render for PromptEditor {
                     .gap_2()
                     .child(ModelSelector::new(
                         self.fs.clone(),
-                        IconButton::new("context", IconName::Settings)
+                        IconButton::new("context", IconName::SettingsAlt)
                             .shape(IconButtonShape::Square)
                             .icon_size(IconSize::Small)
                             .icon_color(Color::Muted)
@@ -556,7 +622,7 @@ impl Render for PromptEditor {
                                 Tooltip::with_meta(
                                     format!(
                                         "Using {}",
-                                        LanguageModelCompletionProvider::read_global(cx)
+                                        LanguageModelRegistry::read_global(cx)
                                             .active_model()
                                             .map(|model| model.name().0)
                                             .unwrap_or_else(|| "No model selected".into()),
@@ -588,7 +654,7 @@ impl Render for PromptEditor {
             .child(div().flex_1().child(self.render_prompt_editor(cx)))
             .child(
                 h_flex()
-                    .gap_2()
+                    .gap_1()
                     .pr_4()
                     .children(self.render_token_count(cx))
                     .children(buttons),
@@ -700,6 +766,9 @@ impl PromptEditor {
 
     fn count_tokens(&mut self, cx: &mut ViewContext<Self>) {
         let assist_id = self.id;
+        let Some(model) = LanguageModelRegistry::read_global(cx).active_model() else {
+            return;
+        };
         self.pending_token_count = cx.spawn(|this, mut cx| async move {
             cx.background_executor().timer(Duration::from_secs(1)).await;
             let request =
@@ -707,11 +776,7 @@ impl PromptEditor {
                     inline_assistant.request_for_inline_assist(assist_id, cx)
                 })??;
 
-            let token_count = cx
-                .update(|cx| {
-                    LanguageModelCompletionProvider::read_global(cx).count_tokens(request, cx)
-                })?
-                .await?;
+            let token_count = cx.update(|cx| model.count_tokens(request, cx))?.await?;
             this.update(&mut cx, |this, cx| {
                 this.token_count = Some(token_count);
                 cx.notify();
@@ -789,13 +854,22 @@ impl PromptEditor {
             CodegenStatus::Pending => {
                 cx.emit(PromptEditorEvent::DismissRequested);
             }
-            CodegenStatus::Done | CodegenStatus::Error(_) => {
+            CodegenStatus::Done => {
                 if self.edited_since_done {
                     cx.emit(PromptEditorEvent::StartRequested);
                 } else {
-                    cx.emit(PromptEditorEvent::ConfirmRequested);
+                    cx.emit(PromptEditorEvent::ConfirmRequested { execute: false });
                 }
             }
+            CodegenStatus::Error(_) => {
+                cx.emit(PromptEditorEvent::StartRequested);
+            }
+        }
+    }
+
+    fn secondary_confirm(&mut self, _: &menu::SecondaryConfirm, cx: &mut ViewContext<Self>) {
+        if matches!(self.codegen.read(cx).status, CodegenStatus::Done) {
+            cx.emit(PromptEditorEvent::ConfirmRequested { execute: true });
         }
     }
 
@@ -840,7 +914,7 @@ impl PromptEditor {
     }
 
     fn render_token_count(&self, cx: &mut ViewContext<Self>) -> Option<impl IntoElement> {
-        let model = LanguageModelCompletionProvider::read_global(cx).active_model()?;
+        let model = LanguageModelRegistry::read_global(cx).active_model()?;
         let token_count = self.token_count?;
         let max_token_count = model.max_token_count();
 
@@ -904,11 +978,11 @@ impl PromptEditor {
             } else {
                 cx.theme().colors().text
             },
-            font_family: settings.ui_font.family.clone(),
-            font_features: settings.ui_font.features.clone(),
-            font_size: rems(0.875).into(),
-            font_weight: settings.ui_font.weight,
-            line_height: relative(1.3),
+            font_family: settings.buffer_font.family.clone(),
+            font_fallbacks: settings.buffer_font.fallbacks.clone(),
+            font_size: settings.buffer_font_size.into(),
+            font_weight: settings.buffer_font.weight,
+            line_height: relative(settings.buffer_line_height.value()),
             ..Default::default()
         };
         EditorElement::new(
@@ -943,8 +1017,8 @@ impl TerminalTransaction {
     }
 
     pub fn push(&mut self, hunk: String, cx: &mut AppContext) {
-        // Ensure that the assistant cannot accidently execute commands that are streamed into the terminal
-        let input = hunk.replace(CARRIAGE_RETURN, " ");
+        // Ensure that the assistant cannot accidentally execute commands that are streamed into the terminal
+        let input = Self::sanitize_input(hunk);
         self.terminal
             .update(cx, |terminal, _| terminal.input(input));
     }
@@ -959,6 +1033,10 @@ impl TerminalTransaction {
             terminal.input(CARRIAGE_RETURN.to_string())
         });
     }
+
+    fn sanitize_input(input: String) -> String {
+        input.replace(['\r', '\n'], "")
+    }
 }
 
 pub struct Codegen {
@@ -966,6 +1044,7 @@ pub struct Codegen {
     telemetry: Option<Arc<Telemetry>>,
     terminal: Model<Terminal>,
     generation: Task<()>,
+    message_id: Option<String>,
     transaction: Option<TerminalTransaction>,
 }
 
@@ -976,59 +1055,81 @@ impl Codegen {
             telemetry,
             status: CodegenStatus::Idle,
             generation: Task::ready(()),
+            message_id: None,
             transaction: None,
         }
     }
 
     pub fn start(&mut self, prompt: LanguageModelRequest, cx: &mut ModelContext<Self>) {
+        let Some(model) = LanguageModelRegistry::read_global(cx).active_model() else {
+            return;
+        };
+
+        let model_api_key = model.api_key(cx);
+        let http_client = cx.http_client();
+        let telemetry = self.telemetry.clone();
         self.status = CodegenStatus::Pending;
         self.transaction = Some(TerminalTransaction::start(self.terminal.clone()));
-
-        let telemetry = self.telemetry.clone();
-        let model_telemetry_id = LanguageModelCompletionProvider::read_global(cx)
-            .active_model()
-            .map(|m| m.telemetry_id())
-            .unwrap_or_default();
-        let response =
-            LanguageModelCompletionProvider::read_global(cx).stream_completion(prompt, cx);
-
         self.generation = cx.spawn(|this, mut cx| async move {
-            let response = response.await;
+            let model_telemetry_id = model.telemetry_id();
+            let model_provider_id = model.provider_id();
+            let response = model.stream_completion_text(prompt, &cx).await;
             let generate = async {
+                let message_id = response
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.message_id.clone());
+
                 let (mut hunks_tx, mut hunks_rx) = mpsc::channel(1);
 
-                let task = cx.background_executor().spawn(async move {
-                    let mut response_latency = None;
-                    let request_start = Instant::now();
-                    let task = async {
-                        let mut chunks = response?;
-                        while let Some(chunk) = chunks.next().await {
-                            if response_latency.is_none() {
-                                response_latency = Some(request_start.elapsed());
+                let task = cx.background_executor().spawn({
+                    let message_id = message_id.clone();
+                    let executor = cx.background_executor().clone();
+                    async move {
+                        let mut response_latency = None;
+                        let request_start = Instant::now();
+                        let task = async {
+                            let mut chunks = response?.stream;
+                            while let Some(chunk) = chunks.next().await {
+                                if response_latency.is_none() {
+                                    response_latency = Some(request_start.elapsed());
+                                }
+                                let chunk = chunk?;
+                                hunks_tx.send(chunk).await?;
                             }
-                            let chunk = chunk?;
-                            hunks_tx.send(chunk).await?;
-                        }
 
-                        anyhow::Ok(())
-                    };
+                            anyhow::Ok(())
+                        };
 
-                    let result = task.await;
+                        let result = task.await;
 
-                    let error_message = result.as_ref().err().map(|error| error.to_string());
-                    if let Some(telemetry) = telemetry {
-                        telemetry.report_assistant_event(
-                            None,
-                            telemetry_events::AssistantKind::Inline,
-                            model_telemetry_id,
-                            response_latency,
-                            error_message,
+                        let error_message = result.as_ref().err().map(|error| error.to_string());
+                        report_assistant_event(
+                            AssistantEvent {
+                                conversation_id: None,
+                                kind: AssistantKind::InlineTerminal,
+                                message_id,
+                                phase: AssistantPhase::Response,
+                                model: model_telemetry_id,
+                                model_provider: model_provider_id.to_string(),
+                                response_latency,
+                                error_message,
+                                language_name: None,
+                            },
+                            telemetry,
+                            http_client,
+                            model_api_key,
+                            &executor,
                         );
-                    }
 
-                    result?;
-                    anyhow::Ok(())
+                        result?;
+                        anyhow::Ok(())
+                    }
                 });
+
+                this.update(&mut cx, |this, _| {
+                    this.message_id = message_id;
+                })?;
 
                 while let Some(hunk) = hunks_rx.next().await {
                     this.update(&mut cx, |this, cx| {

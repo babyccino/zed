@@ -11,9 +11,12 @@ use std::{
 
 use anyhow::{anyhow, Result};
 use derive_more::{Deref, DerefMut};
-use futures::{channel::oneshot, future::LocalBoxFuture, Future};
+use futures::{
+    channel::oneshot,
+    future::{LocalBoxFuture, Shared},
+    Future, FutureExt,
+};
 use slotmap::SlotMap;
-use smol::future::FutureExt;
 
 pub use async_context::*;
 use collections::{FxHashMap, FxHashSet, VecDeque};
@@ -25,8 +28,8 @@ pub use test_context::*;
 use util::ResultExt;
 
 use crate::{
-    current_platform, init_app_menus, Action, ActionRegistry, Any, AnyView, AnyWindowHandle,
-    AssetCache, AssetSource, BackgroundExecutor, ClipboardItem, Context, DispatchPhase, DisplayId,
+    current_platform, hash, init_app_menus, Action, ActionRegistry, Any, AnyView, AnyWindowHandle,
+    Asset, AssetSource, BackgroundExecutor, ClipboardItem, Context, DispatchPhase, DisplayId,
     Entity, EventEmitter, ForegroundExecutor, Global, KeyBinding, Keymap, Keystroke, LayoutId,
     Menu, MenuItem, OwnedMenu, PathPromptOptions, Pixels, Platform, PlatformDisplay, Point,
     PromptBuilder, PromptHandle, PromptLevel, Render, RenderablePromptHandle, Reservation,
@@ -114,7 +117,7 @@ impl App {
         Self(AppContext::new(
             current_platform(false),
             Arc::new(()),
-            http_client::client(None),
+            Arc::new(NullHttpClient),
         ))
     }
 
@@ -125,7 +128,7 @@ impl App {
         Self(AppContext::new(
             current_platform(true),
             Arc::new(()),
-            http_client::client(None),
+            Arc::new(NullHttpClient),
         ))
     }
 
@@ -135,6 +138,14 @@ impl App {
         let asset_source = Arc::new(asset_source);
         context_lock.asset_source = asset_source.clone();
         context_lock.svg_renderer = SvgRenderer::new(asset_source);
+        drop(context_lock);
+        self
+    }
+
+    /// Set the http client for the application
+    pub fn with_http_client(self, http_client: Arc<dyn HttpClient>) -> Self {
+        let mut context_lock = self.0.borrow_mut();
+        context_lock.http_client = http_client;
         drop(context_lock);
         self
     }
@@ -201,10 +212,12 @@ impl App {
 
 type Handler = Box<dyn FnMut(&mut AppContext) -> bool + 'static>;
 type Listener = Box<dyn FnMut(&dyn Any, &mut AppContext) -> bool + 'static>;
-type KeystrokeObserver = Box<dyn FnMut(&KeystrokeEvent, &mut WindowContext) + 'static>;
+pub(crate) type KeystrokeObserver =
+    Box<dyn FnMut(&KeystrokeEvent, &mut WindowContext) -> bool + 'static>;
 type QuitHandler = Box<dyn FnOnce(&mut AppContext) -> LocalBoxFuture<'static, ()> + 'static>;
 type ReleaseListener = Box<dyn FnOnce(&mut dyn Any, &mut AppContext) + 'static>;
 type NewViewListener = Box<dyn FnMut(AnyView, &mut WindowContext) + 'static>;
+type NewModelListener = Box<dyn FnMut(AnyModel, &mut AppContext) + 'static>;
 
 /// Contains the state of the full application, and passed as a reference to a variety of callbacks.
 /// Other contexts such as [ModelContext], [WindowContext], and [ViewContext] deref to this type, making it the most general context type.
@@ -220,12 +233,12 @@ pub struct AppContext {
     pub(crate) background_executor: BackgroundExecutor,
     pub(crate) foreground_executor: ForegroundExecutor,
     pub(crate) loading_assets: FxHashMap<(TypeId, u64), Box<dyn Any>>,
-    pub(crate) asset_cache: AssetCache,
     asset_source: Arc<dyn AssetSource>,
     pub(crate) svg_renderer: SvgRenderer,
     http_client: Arc<dyn HttpClient>,
     pub(crate) globals_by_type: FxHashMap<TypeId, Box<dyn Any>>,
     pub(crate) entities: EntityMap,
+    pub(crate) new_model_observers: SubscriberSet<TypeId, NewModelListener>,
     pub(crate) new_view_observers: SubscriberSet<TypeId, NewViewListener>,
     pub(crate) windows: SlotMap<WindowId, Option<Window>>,
     pub(crate) window_handles: FxHashMap<WindowId, AnyWindowHandle>,
@@ -245,6 +258,9 @@ pub struct AppContext {
     pub(crate) layout_id_buffer: Vec<LayoutId>, // We recycle this memory across layout requests.
     pub(crate) propagate_event: bool,
     pub(crate) prompt_builder: Option<PromptBuilder>,
+
+    #[cfg(any(test, feature = "test-support", debug_assertions))]
+    pub(crate) name: Option<&'static str>,
 }
 
 impl AppContext {
@@ -276,13 +292,13 @@ impl AppContext {
                 background_executor: executor,
                 foreground_executor,
                 svg_renderer: SvgRenderer::new(asset_source.clone()),
-                asset_cache: AssetCache::new(),
                 loading_assets: Default::default(),
                 asset_source,
                 http_client,
                 globals_by_type: FxHashMap::default(),
                 entities,
                 new_view_observers: SubscriberSet::new(),
+                new_model_observers: SubscriberSet::new(),
                 window_handles: FxHashMap::default(),
                 windows: SlotMap::with_key(),
                 keymap: Rc::new(RefCell::new(Keymap::default())),
@@ -299,6 +315,9 @@ impl AppContext {
                 layout_id_buffer: Default::default(),
                 propagate_event: true,
                 prompt_builder: Some(PromptBuilder::Default),
+
+                #[cfg(any(test, feature = "test-support", debug_assertions))]
+                name: None,
             }),
         });
 
@@ -338,7 +357,7 @@ impl AppContext {
     }
 
     /// Gracefully quit the application via the platform's standard routine.
-    pub fn quit(&mut self) {
+    pub fn quit(&self) {
         self.platform.quit();
     }
 
@@ -469,6 +488,15 @@ impl AppContext {
             .collect()
     }
 
+    /// Returns the window handles ordered by their appearance on screen, front to back.
+    ///
+    /// The first window in the returned list is the active/topmost window of the application.
+    ///
+    /// This method returns None if the platform doesn't implement the method yet.
+    pub fn window_stack(&self) -> Option<Vec<AnyWindowHandle>> {
+        self.platform.window_stack()
+    }
+
     /// Returns a handle to the window that is currently focused at the platform level, if one exists.
     pub fn active_window(&self) -> Option<AnyWindowHandle> {
         self.platform.active_window()
@@ -496,7 +524,7 @@ impl AppContext {
                 }
                 Err(e) => {
                     cx.windows.remove(id);
-                    return Err(e);
+                    Err(e)
                 }
             }
         })
@@ -647,6 +675,11 @@ impl AppContext {
         self.platform.reveal_path(path)
     }
 
+    /// Opens the specified path with the system's default application.
+    pub fn open_with_system(&self, path: &Path) {
+        self.platform.open_with_system(path)
+    }
+
     /// Returns whether the user has configured scrollbars to auto-hide at the platform level.
     pub fn should_auto_hide_scrollbars(&self) -> bool {
         self.platform.should_auto_hide_scrollbars()
@@ -658,7 +691,7 @@ impl AppContext {
     }
 
     /// Updates the http client assigned to GPUI
-    pub fn update_http_client(&mut self, new_client: Arc<dyn HttpClient>) {
+    pub fn set_http_client(&mut self, new_client: Arc<dyn HttpClient>) {
         self.http_client = new_client;
     }
 
@@ -964,6 +997,7 @@ impl AppContext {
     }
 
     /// Move the global of the given type to the stack.
+    #[track_caller]
     pub(crate) fn lease_global<G: Global>(&mut self) -> GlobalLease<G> {
         GlobalLease::new(
             self.globals_by_type
@@ -980,19 +1014,16 @@ impl AppContext {
         self.globals_by_type.insert(global_type, lease.global);
     }
 
-    pub(crate) fn new_view_observer(
-        &mut self,
-        key: TypeId,
-        value: NewViewListener,
-    ) -> Subscription {
+    pub(crate) fn new_view_observer(&self, key: TypeId, value: NewViewListener) -> Subscription {
         let (subscription, activate) = self.new_view_observers.insert(key, value);
         activate();
         subscription
     }
+
     /// Arrange for the given function to be invoked whenever a view of the specified type is created.
     /// The function will be passed a mutable reference to the view along with an appropriate context.
     pub fn observe_new_views<V: 'static>(
-        &mut self,
+        &self,
         on_new: impl 'static + Fn(&mut V, &mut ViewContext<V>),
     ) -> Subscription {
         self.new_view_observer(
@@ -1008,10 +1039,35 @@ impl AppContext {
         )
     }
 
+    pub(crate) fn new_model_observer(&self, key: TypeId, value: NewModelListener) -> Subscription {
+        let (subscription, activate) = self.new_model_observers.insert(key, value);
+        activate();
+        subscription
+    }
+
+    /// Arrange for the given function to be invoked whenever a view of the specified type is created.
+    /// The function will be passed a mutable reference to the view along with an appropriate context.
+    pub fn observe_new_models<T: 'static>(
+        &self,
+        on_new: impl 'static + Fn(&mut T, &mut ModelContext<T>),
+    ) -> Subscription {
+        self.new_model_observer(
+            TypeId::of::<T>(),
+            Box::new(move |any_model: AnyModel, cx: &mut AppContext| {
+                any_model
+                    .downcast::<T>()
+                    .unwrap()
+                    .update(cx, |model_state, cx| {
+                        on_new(model_state, cx);
+                    })
+            }),
+        )
+    }
+
     /// Observe the release of a model or view. The callback is invoked after the model or view
     /// has no more strong references but before it has been dropped.
     pub fn observe_release<E, T>(
-        &mut self,
+        &self,
         handle: &E,
         on_release: impl FnOnce(&mut T, &mut AppContext) + 'static,
     ) -> Subscription
@@ -1035,17 +1091,24 @@ impl AppContext {
     /// and that this API will not be invoked if the event's propagation is stopped.
     pub fn observe_keystrokes(
         &mut self,
-        f: impl FnMut(&KeystrokeEvent, &mut WindowContext) + 'static,
+        mut f: impl FnMut(&KeystrokeEvent, &mut WindowContext) + 'static,
     ) -> Subscription {
         fn inner(
-            keystroke_observers: &mut SubscriberSet<(), KeystrokeObserver>,
+            keystroke_observers: &SubscriberSet<(), KeystrokeObserver>,
             handler: KeystrokeObserver,
         ) -> Subscription {
             let (subscription, activate) = keystroke_observers.insert((), handler);
             activate();
             subscription
         }
-        inner(&mut self.keystroke_observers, Box::new(f))
+
+        inner(
+            &mut self.keystroke_observers,
+            Box::new(move |event, cx| {
+                f(event, cx);
+                true
+            }),
+        )
     }
 
     /// Register key bindings.
@@ -1109,7 +1172,7 @@ impl AppContext {
     /// Register a callback to be invoked when the application is about to quit.
     /// It is not possible to cancel the quit event at this point.
     pub fn on_app_quit<Fut>(
-        &mut self,
+        &self,
         mut on_quit: impl FnMut(&mut AppContext) -> Fut + 'static,
     ) -> Subscription
     where
@@ -1155,7 +1218,7 @@ impl AppContext {
     }
 
     /// Sets the menu bar for this application. This will replace any existing menu bar.
-    pub fn set_menus(&mut self, menus: Vec<Menu>) {
+    pub fn set_menus(&self, menus: Vec<Menu>) {
         self.platform.set_menus(menus, &self.keymap.borrow());
     }
 
@@ -1165,7 +1228,7 @@ impl AppContext {
     }
 
     /// Sets the right click menu for the app icon in the dock
-    pub fn set_dock_menu(&mut self, menus: Vec<MenuItem>) {
+    pub fn set_dock_menu(&self, menus: Vec<MenuItem>) {
         self.platform.set_dock_menu(menus, &self.keymap.borrow());
     }
 
@@ -1173,7 +1236,7 @@ impl AppContext {
     /// The list is usually shown on the application icon's context menu in the dock,
     /// and allows to open the recent files via that context menu.
     /// If the path is already in the list, it will be moved to the bottom of the list.
-    pub fn add_recent_document(&mut self, path: &Path) {
+    pub fn add_recent_document(&self, path: &Path) {
         self.platform.add_recent_document(path);
     }
 
@@ -1258,6 +1321,46 @@ impl AppContext {
     ) {
         self.prompt_builder = Some(PromptBuilder::Custom(Box::new(renderer)))
     }
+
+    /// Remove an asset from GPUI's cache
+    pub fn remove_cached_asset<A: Asset + 'static>(&mut self, source: &A::Source) {
+        let asset_id = (TypeId::of::<A>(), hash(source));
+        self.loading_assets.remove(&asset_id);
+    }
+
+    /// Asynchronously load an asset, if the asset hasn't finished loading this will return None.
+    ///
+    /// Note that the multiple calls to this method will only result in one `Asset::load` call at a
+    /// time, and the results of this call will be cached
+    ///
+    /// This asset will not be cached by default, see [Self::use_cached_asset]
+    pub fn fetch_asset<A: Asset + 'static>(
+        &mut self,
+        source: &A::Source,
+    ) -> (Shared<Task<A::Output>>, bool) {
+        let asset_id = (TypeId::of::<A>(), hash(source));
+        let mut is_first = false;
+        let task = self
+            .loading_assets
+            .remove(&asset_id)
+            .map(|boxed_task| *boxed_task.downcast::<Shared<Task<A::Output>>>().unwrap())
+            .unwrap_or_else(|| {
+                is_first = true;
+                let future = A::load(source.clone(), self);
+                let task = self.background_executor().spawn(future).shared();
+                task
+            });
+
+        self.loading_assets.insert(asset_id, Box::new(task.clone()));
+
+        (task, is_first)
+    }
+
+    /// Get the name for this App.
+    #[cfg(any(test, feature = "test-support", debug_assertions))]
+    pub fn get_name(&self) -> &'static str {
+        self.name.as_ref().unwrap()
+    }
 }
 
 impl Context for AppContext {
@@ -1272,8 +1375,21 @@ impl Context for AppContext {
     ) -> Model<T> {
         self.update(|cx| {
             let slot = cx.entities.reserve();
+            let model = slot.clone();
             let entity = build_model(&mut ModelContext::new(cx, slot.downgrade()));
-            cx.entities.insert(slot, entity)
+            cx.entities.insert(slot, entity);
+
+            // Non-generic part to avoid leaking SubscriberSet to invokers of `new_view`.
+            fn notify_observers(cx: &mut AppContext, tid: TypeId, model: AnyModel) {
+                cx.new_model_observers.clone().retain(&tid, |observer| {
+                    let any_model = model.clone();
+                    (observer)(any_model, cx);
+                    true
+                });
+            }
+            notify_observers(cx, TypeId::of::<T>(), AnyModel::from(model.clone()));
+
+            model
         })
     }
 
@@ -1454,4 +1570,26 @@ pub struct KeystrokeEvent {
 
     /// The action that was resolved for the keystroke, if any
     pub action: Option<Box<dyn Action>>,
+}
+
+struct NullHttpClient;
+
+impl HttpClient for NullHttpClient {
+    fn send(
+        &self,
+        _req: http_client::Request<http_client::AsyncBody>,
+    ) -> futures::future::BoxFuture<
+        'static,
+        Result<http_client::Response<http_client::AsyncBody>, anyhow::Error>,
+    > {
+        async move { Err(anyhow!("No HttpClient available")) }.boxed()
+    }
+
+    fn proxy(&self) -> Option<&http_client::Uri> {
+        None
+    }
+
+    fn type_name(&self) -> &'static str {
+        type_name::<Self>()
+    }
 }

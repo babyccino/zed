@@ -1,16 +1,17 @@
 mod connection_pool;
 
+use crate::api::CloudflareIpCountryHeader;
+use crate::llm::LlmTokenClaims;
 use crate::{
     auth,
     db::{
-        self, dev_server, BufferId, Capability, Channel, ChannelId, ChannelRole, ChannelsForUser,
-        CreatedChannelMessage, Database, DevServerId, DevServerProjectId, InviteMemberResult,
-        MembershipUpdated, MessageId, NotificationId, PrincipalId, Project, ProjectId,
-        RejoinedProject, RemoveChannelMemberResult, ReplicaId, RespondToChannelInvite, RoomId,
-        ServerId, UpdatedChannelMessage, User, UserId,
+        self, BufferId, Capability, Channel, ChannelId, ChannelRole, ChannelsForUser,
+        CreatedChannelMessage, Database, InviteMemberResult, MembershipUpdated, MessageId,
+        NotificationId, Project, ProjectId, RejoinedProject, RemoveChannelMemberResult, ReplicaId,
+        RespondToChannelInvite, RoomId, ServerId, UpdatedChannelMessage, User, UserId,
     },
     executor::Executor,
-    AppState, Error, RateLimit, RateLimiter, Result,
+    AppState, Config, Error, RateLimit, Result,
 };
 use anyhow::{anyhow, bail, Context as _};
 use async_tungstenite::tungstenite::{
@@ -29,25 +30,25 @@ use axum::{
     routing::get,
     Extension, Router, TypedHeader,
 };
+use chrono::Utc;
 use collections::{HashMap, HashSet};
 pub use connection_pool::{ConnectionPool, ZedVersion};
 use core::fmt::{self, Debug, Formatter};
+use http_client::HttpClient;
 use open_ai::{OpenAiEmbeddingModel, OPEN_AI_API_URL};
+use reqwest_client::ReqwestClient;
 use sha2::Digest;
 use supermaven_api::{CreateExternalUserRequest, SupermavenAdminApi};
 
 use futures::{
-    channel::oneshot,
-    future::{self, BoxFuture},
-    stream::FuturesUnordered,
-    FutureExt, SinkExt, StreamExt, TryStreamExt,
+    channel::oneshot, future::BoxFuture, stream::FuturesUnordered, FutureExt, SinkExt, StreamExt,
+    TryStreamExt,
 };
-use http_client::IsahcHttpClient;
 use prometheus::{register_int_gauge, IntGauge};
 use rpc::{
     proto::{
-        self, Ack, AnyTypedEnvelope, EntityMessage, EnvelopedMessage, LanguageModelRole,
-        LiveKitConnectionInfo, RequestMessage, ShareProject, UpdateChannelBufferCollaborators,
+        self, Ack, AnyTypedEnvelope, EntityMessage, EnvelopedMessage, LiveKitConnectionInfo,
+        RequestMessage, ShareProject, UpdateChannelBufferCollaborators,
     },
     Connection, ConnectionId, ErrorCode, ErrorCodeExt, ErrorExt, Peer, Receipt, TypedEnvelope,
 };
@@ -68,14 +69,12 @@ use std::{
     time::{Duration, Instant},
 };
 use time::OffsetDateTime;
-use tokio::sync::{watch, Semaphore};
+use tokio::sync::{watch, MutexGuard, Semaphore};
 use tower::ServiceBuilder;
 use tracing::{
     field::{self},
     info_span, instrument, Instrument,
 };
-
-use self::connection_pool::VersionedMessage;
 
 pub const RECONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -103,39 +102,23 @@ impl<R: RequestMessage> Response<R> {
     }
 }
 
-struct StreamingResponse<R: RequestMessage> {
-    peer: Arc<Peer>,
-    receipt: Receipt<R>,
-}
-
-impl<R: RequestMessage> StreamingResponse<R> {
-    fn send(&self, payload: R::Response) -> Result<()> {
-        self.peer.respond(self.receipt, payload)?;
-        Ok(())
-    }
-}
-
 #[derive(Clone, Debug)]
 pub enum Principal {
     User(User),
     Impersonated { user: User, admin: User },
-    DevServer(dev_server::Model),
 }
 
 impl Principal {
     fn update_span(&self, span: &tracing::Span) {
         match &self {
             Principal::User(user) => {
-                span.record("user_id", &user.id.0);
+                span.record("user_id", user.id.0);
                 span.record("login", &user.github_login);
             }
             Principal::Impersonated { user, admin } => {
-                span.record("user_id", &user.id.0);
+                span.record("user_id", user.id.0);
                 span.record("login", &user.github_login);
                 span.record("impersonator", &admin.github_login);
-            }
-            Principal::DevServer(dev_server) => {
-                span.record("dev_server_id", &dev_server.id.0);
             }
         }
     }
@@ -148,10 +131,12 @@ struct Session {
     db: Arc<tokio::sync::Mutex<DbHandle>>,
     peer: Arc<Peer>,
     connection_pool: Arc<parking_lot::Mutex<ConnectionPool>>,
-    live_kit_client: Option<Arc<dyn live_kit_server::api::Client>>,
+    app_state: Arc<AppState>,
     supermaven_client: Option<Arc<SupermavenAdminApi>>,
-    http_client: Arc<IsahcHttpClient>,
-    rate_limiter: Arc<RateLimiter>,
+    http_client: Arc<dyn HttpClient>,
+    /// The GeoIP country code for the user.
+    #[allow(unused)]
+    geoip_country_code: Option<String>,
     _executor: Executor,
 }
 
@@ -175,42 +160,48 @@ impl Session {
         }
     }
 
-    fn for_user(self) -> Option<UserSession> {
-        UserSession::new(self)
-    }
-
-    fn for_dev_server(self) -> Option<DevServerSession> {
-        DevServerSession::new(self)
-    }
-
-    fn user_id(&self) -> Option<UserId> {
-        match &self.principal {
-            Principal::User(user) => Some(user.id),
-            Principal::Impersonated { user, .. } => Some(user.id),
-            Principal::DevServer(_) => None,
-        }
-    }
-
     fn is_staff(&self) -> bool {
         match &self.principal {
             Principal::User(user) => user.admin,
             Principal::Impersonated { .. } => true,
-            Principal::DevServer(_) => false,
         }
     }
 
-    fn dev_server_id(&self) -> Option<DevServerId> {
-        match &self.principal {
-            Principal::User(_) | Principal::Impersonated { .. } => None,
-            Principal::DevServer(dev_server) => Some(dev_server.id),
+    pub async fn has_llm_subscription(
+        &self,
+        db: &MutexGuard<'_, DbHandle>,
+    ) -> anyhow::Result<bool> {
+        if self.is_staff() {
+            return Ok(true);
+        }
+
+        let user_id = self.user_id();
+
+        Ok(db.has_active_billing_subscription(user_id).await?)
+    }
+
+    pub async fn current_plan(
+        &self,
+        _db: &MutexGuard<'_, DbHandle>,
+    ) -> anyhow::Result<proto::Plan> {
+        if self.is_staff() {
+            Ok(proto::Plan::ZedPro)
+        } else {
+            Ok(proto::Plan::Free)
         }
     }
 
-    fn principal_id(&self) -> PrincipalId {
+    fn user_id(&self) -> UserId {
         match &self.principal {
-            Principal::User(user) => PrincipalId::UserId(user.id),
-            Principal::Impersonated { user, .. } => PrincipalId::UserId(user.id),
-            Principal::DevServer(dev_server) => PrincipalId::DevServerId(dev_server.id),
+            Principal::User(user) => user.id,
+            Principal::Impersonated { user, .. } => user.id,
+        }
+    }
+
+    pub fn email(&self) -> Option<String> {
+        match &self.principal {
+            Principal::User(user) => user.email_address.clone(),
+            Principal::Impersonated { user, .. } => user.email_address.clone(),
         }
     }
 }
@@ -226,140 +217,8 @@ impl Debug for Session {
                 result.field("user", &user.github_login);
                 result.field("impersonator", &admin.github_login);
             }
-            Principal::DevServer(dev_server) => {
-                result.field("dev_server", &dev_server.id);
-            }
         }
         result.field("connection_id", &self.connection_id).finish()
-    }
-}
-
-struct UserSession(Session);
-
-impl UserSession {
-    pub fn new(s: Session) -> Option<Self> {
-        s.user_id().map(|_| UserSession(s))
-    }
-    pub fn user_id(&self) -> UserId {
-        self.0.user_id().unwrap()
-    }
-
-    pub fn email(&self) -> Option<String> {
-        match &self.0.principal {
-            Principal::User(user) => user.email_address.clone(),
-            Principal::Impersonated { user, .. } => user.email_address.clone(),
-            Principal::DevServer(..) => None,
-        }
-    }
-}
-
-impl Deref for UserSession {
-    type Target = Session;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl DerefMut for UserSession {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-struct DevServerSession(Session);
-
-impl DevServerSession {
-    pub fn new(s: Session) -> Option<Self> {
-        s.dev_server_id().map(|_| DevServerSession(s))
-    }
-    pub fn dev_server_id(&self) -> DevServerId {
-        self.0.dev_server_id().unwrap()
-    }
-
-    fn dev_server(&self) -> &dev_server::Model {
-        match &self.0.principal {
-            Principal::DevServer(dev_server) => dev_server,
-            _ => unreachable!(),
-        }
-    }
-}
-
-impl Deref for DevServerSession {
-    type Target = Session;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl DerefMut for DevServerSession {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-fn user_handler<M: RequestMessage, Fut>(
-    handler: impl 'static + Send + Sync + Fn(M, Response<M>, UserSession) -> Fut,
-) -> impl 'static + Send + Sync + Fn(M, Response<M>, Session) -> BoxFuture<'static, Result<()>>
-where
-    Fut: Send + Future<Output = Result<()>>,
-{
-    let handler = Arc::new(handler);
-    move |message, response, session| {
-        let handler = handler.clone();
-        Box::pin(async move {
-            if let Some(user_session) = session.for_user() {
-                Ok(handler(message, response, user_session).await?)
-            } else {
-                Err(Error::Internal(anyhow!(
-                    "must be a user to call {}",
-                    M::NAME
-                )))
-            }
-        })
-    }
-}
-
-fn dev_server_handler<M: RequestMessage, Fut>(
-    handler: impl 'static + Send + Sync + Fn(M, Response<M>, DevServerSession) -> Fut,
-) -> impl 'static + Send + Sync + Fn(M, Response<M>, Session) -> BoxFuture<'static, Result<()>>
-where
-    Fut: Send + Future<Output = Result<()>>,
-{
-    let handler = Arc::new(handler);
-    move |message, response, session| {
-        let handler = handler.clone();
-        Box::pin(async move {
-            if let Some(dev_server_session) = session.for_dev_server() {
-                Ok(handler(message, response, dev_server_session).await?)
-            } else {
-                Err(Error::Internal(anyhow!(
-                    "must be a dev server to call {}",
-                    M::NAME
-                )))
-            }
-        })
-    }
-}
-
-fn user_message_handler<M: EnvelopedMessage, InnertRetFut>(
-    handler: impl 'static + Send + Sync + Fn(M, UserSession) -> InnertRetFut,
-) -> impl 'static + Send + Sync + Fn(M, Session) -> BoxFuture<'static, Result<()>>
-where
-    InnertRetFut: Send + Future<Output = Result<()>>,
-{
-    let handler = Arc::new(handler);
-    move |message, session| {
-        let handler = handler.clone();
-        Box::pin(async move {
-            if let Some(user_session) = session.for_user() {
-                Ok(handler(message, user_session).await?)
-            } else {
-                Err(Error::Internal(anyhow!(
-                    "must be a user to call {}",
-                    M::NAME
-                )))
-            }
-        })
     }
 }
 
@@ -416,143 +275,65 @@ impl Server {
 
         server
             .add_request_handler(ping)
-            .add_request_handler(user_handler(create_room))
-            .add_request_handler(user_handler(join_room))
-            .add_request_handler(user_handler(rejoin_room))
-            .add_request_handler(user_handler(leave_room))
-            .add_request_handler(user_handler(set_room_participant_role))
-            .add_request_handler(user_handler(call))
-            .add_request_handler(user_handler(cancel_call))
-            .add_message_handler(user_message_handler(decline_call))
-            .add_request_handler(user_handler(update_participant_location))
-            .add_request_handler(user_handler(share_project))
+            .add_request_handler(create_room)
+            .add_request_handler(join_room)
+            .add_request_handler(rejoin_room)
+            .add_request_handler(leave_room)
+            .add_request_handler(set_room_participant_role)
+            .add_request_handler(call)
+            .add_request_handler(cancel_call)
+            .add_message_handler(decline_call)
+            .add_request_handler(update_participant_location)
+            .add_request_handler(share_project)
             .add_message_handler(unshare_project)
-            .add_request_handler(user_handler(join_project))
-            .add_request_handler(user_handler(join_hosted_project))
-            .add_request_handler(user_handler(rejoin_dev_server_projects))
-            .add_request_handler(user_handler(create_dev_server_project))
-            .add_request_handler(user_handler(update_dev_server_project))
-            .add_request_handler(user_handler(delete_dev_server_project))
-            .add_request_handler(user_handler(create_dev_server))
-            .add_request_handler(user_handler(regenerate_dev_server_token))
-            .add_request_handler(user_handler(rename_dev_server))
-            .add_request_handler(user_handler(delete_dev_server))
-            .add_request_handler(user_handler(list_remote_directory))
-            .add_request_handler(dev_server_handler(share_dev_server_project))
-            .add_request_handler(dev_server_handler(shutdown_dev_server))
-            .add_request_handler(dev_server_handler(reconnect_dev_server))
-            .add_message_handler(user_message_handler(leave_project))
+            .add_request_handler(join_project)
+            .add_message_handler(leave_project)
             .add_request_handler(update_project)
             .add_request_handler(update_worktree)
             .add_message_handler(start_language_server)
             .add_message_handler(update_language_server)
             .add_message_handler(update_diagnostic_summary)
             .add_message_handler(update_worktree_settings)
-            .add_request_handler(user_handler(
-                forward_project_request_for_owner::<proto::TaskContextForLocation>,
-            ))
-            .add_request_handler(user_handler(
-                forward_project_request_for_owner::<proto::TaskTemplates>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::GetHover>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::GetDefinition>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::GetTypeDefinition>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::GetReferences>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::SearchProject>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::GetDocumentHighlights>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::GetProjectSymbols>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::OpenBufferForSymbol>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::OpenBufferById>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::SynchronizeBuffers>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::InlayHints>,
-            ))
-            .add_request_handler(user_handler(
-                forward_read_only_project_request::<proto::OpenBufferByPath>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::GetCompletions>,
-            ))
-            .add_request_handler(user_handler(
+            .add_request_handler(forward_read_only_project_request::<proto::GetHover>)
+            .add_request_handler(forward_read_only_project_request::<proto::GetDefinition>)
+            .add_request_handler(forward_read_only_project_request::<proto::GetTypeDefinition>)
+            .add_request_handler(forward_read_only_project_request::<proto::GetReferences>)
+            .add_request_handler(forward_find_search_candidates_request)
+            .add_request_handler(forward_read_only_project_request::<proto::GetDocumentHighlights>)
+            .add_request_handler(forward_read_only_project_request::<proto::GetProjectSymbols>)
+            .add_request_handler(forward_read_only_project_request::<proto::OpenBufferForSymbol>)
+            .add_request_handler(forward_read_only_project_request::<proto::OpenBufferById>)
+            .add_request_handler(forward_read_only_project_request::<proto::SynchronizeBuffers>)
+            .add_request_handler(forward_read_only_project_request::<proto::InlayHints>)
+            .add_request_handler(forward_read_only_project_request::<proto::ResolveInlayHint>)
+            .add_request_handler(forward_read_only_project_request::<proto::OpenBufferByPath>)
+            .add_request_handler(forward_read_only_project_request::<proto::GitBranches>)
+            .add_request_handler(forward_mutating_project_request::<proto::UpdateGitBranch>)
+            .add_request_handler(forward_mutating_project_request::<proto::GetCompletions>)
+            .add_request_handler(
                 forward_mutating_project_request::<proto::ApplyCompletionAdditionalEdits>,
-            ))
-            .add_request_handler(user_handler(
-                forward_versioned_mutating_project_request::<proto::OpenNewBuffer>,
-            ))
-            .add_request_handler(user_handler(
+            )
+            .add_request_handler(forward_mutating_project_request::<proto::OpenNewBuffer>)
+            .add_request_handler(
                 forward_mutating_project_request::<proto::ResolveCompletionDocumentation>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::GetCodeActions>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::ApplyCodeAction>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::PrepareRename>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::PerformRename>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::ReloadBuffers>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::FormatBuffers>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::CreateProjectEntry>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::RenameProjectEntry>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::CopyProjectEntry>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::DeleteProjectEntry>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::ExpandProjectEntry>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::OnTypeFormatting>,
-            ))
-            .add_request_handler(user_handler(
-                forward_versioned_mutating_project_request::<proto::SaveBuffer>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::BlameBuffer>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::MultiLspQuery>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::RestartLanguageServers>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::LinkedEditingRange>,
-            ))
+            )
+            .add_request_handler(forward_mutating_project_request::<proto::GetCodeActions>)
+            .add_request_handler(forward_mutating_project_request::<proto::ApplyCodeAction>)
+            .add_request_handler(forward_mutating_project_request::<proto::PrepareRename>)
+            .add_request_handler(forward_mutating_project_request::<proto::PerformRename>)
+            .add_request_handler(forward_mutating_project_request::<proto::ReloadBuffers>)
+            .add_request_handler(forward_mutating_project_request::<proto::FormatBuffers>)
+            .add_request_handler(forward_mutating_project_request::<proto::CreateProjectEntry>)
+            .add_request_handler(forward_mutating_project_request::<proto::RenameProjectEntry>)
+            .add_request_handler(forward_mutating_project_request::<proto::CopyProjectEntry>)
+            .add_request_handler(forward_mutating_project_request::<proto::DeleteProjectEntry>)
+            .add_request_handler(forward_mutating_project_request::<proto::ExpandProjectEntry>)
+            .add_request_handler(forward_mutating_project_request::<proto::OnTypeFormatting>)
+            .add_request_handler(forward_mutating_project_request::<proto::SaveBuffer>)
+            .add_request_handler(forward_mutating_project_request::<proto::BlameBuffer>)
+            .add_request_handler(forward_mutating_project_request::<proto::MultiLspQuery>)
+            .add_request_handler(forward_mutating_project_request::<proto::RestartLanguageServers>)
+            .add_request_handler(forward_mutating_project_request::<proto::LinkedEditingRange>)
             .add_message_handler(create_buffer_for_peer)
             .add_request_handler(update_buffer)
             .add_message_handler(broadcast_project_message_from_host::<proto::RefreshInlayHints>)
@@ -561,89 +342,70 @@ impl Server {
             .add_message_handler(broadcast_project_message_from_host::<proto::BufferSaved>)
             .add_message_handler(broadcast_project_message_from_host::<proto::UpdateDiffBase>)
             .add_request_handler(get_users)
-            .add_request_handler(user_handler(fuzzy_search_users))
-            .add_request_handler(user_handler(request_contact))
-            .add_request_handler(user_handler(remove_contact))
-            .add_request_handler(user_handler(respond_to_contact_request))
+            .add_request_handler(fuzzy_search_users)
+            .add_request_handler(request_contact)
+            .add_request_handler(remove_contact)
+            .add_request_handler(respond_to_contact_request)
             .add_message_handler(subscribe_to_channels)
-            .add_request_handler(user_handler(create_channel))
-            .add_request_handler(user_handler(delete_channel))
-            .add_request_handler(user_handler(invite_channel_member))
-            .add_request_handler(user_handler(remove_channel_member))
-            .add_request_handler(user_handler(set_channel_member_role))
-            .add_request_handler(user_handler(set_channel_visibility))
-            .add_request_handler(user_handler(rename_channel))
-            .add_request_handler(user_handler(join_channel_buffer))
-            .add_request_handler(user_handler(leave_channel_buffer))
-            .add_message_handler(user_message_handler(update_channel_buffer))
-            .add_request_handler(user_handler(rejoin_channel_buffers))
-            .add_request_handler(user_handler(get_channel_members))
-            .add_request_handler(user_handler(respond_to_channel_invite))
-            .add_request_handler(user_handler(join_channel))
-            .add_request_handler(user_handler(join_channel_chat))
-            .add_message_handler(user_message_handler(leave_channel_chat))
-            .add_request_handler(user_handler(send_channel_message))
-            .add_request_handler(user_handler(remove_channel_message))
-            .add_request_handler(user_handler(update_channel_message))
-            .add_request_handler(user_handler(get_channel_messages))
-            .add_request_handler(user_handler(get_channel_messages_by_id))
-            .add_request_handler(user_handler(get_notifications))
-            .add_request_handler(user_handler(mark_notification_as_read))
-            .add_request_handler(user_handler(move_channel))
-            .add_request_handler(user_handler(follow))
-            .add_message_handler(user_message_handler(unfollow))
-            .add_message_handler(user_message_handler(update_followers))
-            .add_request_handler(user_handler(get_private_user_info))
-            .add_message_handler(user_message_handler(acknowledge_channel_message))
-            .add_message_handler(user_message_handler(acknowledge_buffer_version))
-            .add_request_handler(user_handler(get_supermaven_api_key))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::OpenContext>,
-            ))
-            .add_request_handler(user_handler(
-                forward_mutating_project_request::<proto::SynchronizeContexts>,
-            ))
+            .add_request_handler(create_channel)
+            .add_request_handler(delete_channel)
+            .add_request_handler(invite_channel_member)
+            .add_request_handler(remove_channel_member)
+            .add_request_handler(set_channel_member_role)
+            .add_request_handler(set_channel_visibility)
+            .add_request_handler(rename_channel)
+            .add_request_handler(join_channel_buffer)
+            .add_request_handler(leave_channel_buffer)
+            .add_message_handler(update_channel_buffer)
+            .add_request_handler(rejoin_channel_buffers)
+            .add_request_handler(get_channel_members)
+            .add_request_handler(respond_to_channel_invite)
+            .add_request_handler(join_channel)
+            .add_request_handler(join_channel_chat)
+            .add_message_handler(leave_channel_chat)
+            .add_request_handler(send_channel_message)
+            .add_request_handler(remove_channel_message)
+            .add_request_handler(update_channel_message)
+            .add_request_handler(get_channel_messages)
+            .add_request_handler(get_channel_messages_by_id)
+            .add_request_handler(get_notifications)
+            .add_request_handler(mark_notification_as_read)
+            .add_request_handler(move_channel)
+            .add_request_handler(follow)
+            .add_message_handler(unfollow)
+            .add_message_handler(update_followers)
+            .add_request_handler(get_private_user_info)
+            .add_request_handler(get_llm_api_token)
+            .add_request_handler(accept_terms_of_service)
+            .add_message_handler(acknowledge_channel_message)
+            .add_message_handler(acknowledge_buffer_version)
+            .add_request_handler(get_supermaven_api_key)
+            .add_request_handler(forward_mutating_project_request::<proto::OpenContext>)
+            .add_request_handler(forward_mutating_project_request::<proto::CreateContext>)
+            .add_request_handler(forward_mutating_project_request::<proto::SynchronizeContexts>)
             .add_message_handler(broadcast_project_message_from_host::<proto::AdvertiseContexts>)
             .add_message_handler(update_context)
-            .add_streaming_request_handler({
+            .add_request_handler({
                 let app_state = app_state.clone();
                 move |request, response, session| {
-                    complete_with_language_model(
-                        request,
-                        response,
-                        session,
-                        app_state.config.openai_api_key.clone(),
-                        app_state.config.google_ai_api_key.clone(),
-                        app_state.config.anthropic_api_key.clone(),
-                    )
+                    let app_state = app_state.clone();
+                    async move {
+                        count_language_model_tokens(request, response, session, &app_state.config)
+                            .await
+                    }
                 }
             })
+            .add_request_handler(get_cached_embeddings)
             .add_request_handler({
                 let app_state = app_state.clone();
-                user_handler(move |request, response, session| {
-                    count_tokens_with_language_model(
-                        request,
-                        response,
-                        session,
-                        app_state.config.google_ai_api_key.clone(),
-                    )
-                })
-            })
-            .add_request_handler({
-                user_handler(move |request, response, session| {
-                    get_cached_embeddings(request, response, session)
-                })
-            })
-            .add_request_handler({
-                let app_state = app_state.clone();
-                user_handler(move |request, response, session| {
+                move |request, response, session| {
                     compute_embeddings(
                         request,
                         response,
                         session,
                         app_state.config.openai_api_key.clone(),
                     )
-                })
+                }
             });
 
         Arc::new(server)
@@ -912,40 +674,6 @@ impl Server {
         })
     }
 
-    fn add_streaming_request_handler<F, Fut, M>(&mut self, handler: F) -> &mut Self
-    where
-        F: 'static + Send + Sync + Fn(M, StreamingResponse<M>, Session) -> Fut,
-        Fut: Send + Future<Output = Result<()>>,
-        M: RequestMessage,
-    {
-        let handler = Arc::new(handler);
-        self.add_handler(move |envelope, session| {
-            let receipt = envelope.receipt();
-            let handler = handler.clone();
-            async move {
-                let peer = session.peer.clone();
-                let response = StreamingResponse {
-                    peer: peer.clone(),
-                    receipt,
-                };
-                match (handler)(envelope.payload, response, session).await {
-                    Ok(()) => {
-                        peer.end_stream(receipt)?;
-                        Ok(())
-                    }
-                    Err(error) => {
-                        let proto_err = match &error {
-                            Error::Internal(err) => err.to_proto(),
-                            _ => ErrorCode::Internal.message(format!("{}", error)).to_proto(),
-                        };
-                        peer.respond_with_error(receipt, proto_err)?;
-                        Err(error)
-                    }
-                }
-            }
-        })
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub fn handle_connection(
         self: &Arc<Self>,
@@ -953,6 +681,7 @@ impl Server {
         address: String,
         principal: Principal,
         zed_version: ZedVersion,
+        geoip_country_code: Option<String>,
         send_connection_id: Option<oneshot::Sender<ConnectionId>>,
         executor: Executor,
     ) -> impl Future<Output = ()> {
@@ -962,9 +691,12 @@ impl Server {
             user_id=field::Empty,
             login=field::Empty,
             impersonator=field::Empty,
-            dev_server_id=field::Empty
+            geoip_country_code=field::Empty
         );
         principal.update_span(&span);
+        if let Some(country_code) = geoip_country_code.as_ref() {
+            span.record("geoip_country_code", country_code);
+        }
 
         let mut teardown = self.teardown.subscribe();
         async move {
@@ -979,9 +711,11 @@ impl Server {
                     move |duration| executor.sleep(duration)
                 });
             tracing::Span::current().record("connection_id", format!("{}", connection_id));
+
             tracing::info!("connection opened");
 
-            let http_client = match IsahcHttpClient::new() {
+            let user_agent = format!("Zed Server/{}", env!("CARGO_PKG_VERSION"));
+            let http_client = match ReqwestClient::user_agent(&user_agent) {
                 Ok(http_client) => Arc::new(http_client),
                 Err(error) => {
                     tracing::error!(?error, "failed to create HTTP client");
@@ -989,14 +723,10 @@ impl Server {
                 }
             };
 
-            let supermaven_client = if let Some(supermaven_admin_api_key) = this.app_state.config.supermaven_admin_api_key.clone() {
-                Some(Arc::new(SupermavenAdminApi::new(
+            let supermaven_client = this.app_state.config.supermaven_admin_api_key.clone().map(|supermaven_admin_api_key| Arc::new(SupermavenAdminApi::new(
                     supermaven_admin_api_key.to_string(),
                     http_client.clone(),
-                )))
-            } else {
-                None
-            };
+                )));
 
             let session = Session {
                 principal: principal.clone(),
@@ -1004,9 +734,9 @@ impl Server {
                 db: Arc::new(tokio::sync::Mutex::new(DbHandle(this.app_state.db.clone()))),
                 peer: this.peer.clone(),
                 connection_pool: this.connection_pool.clone(),
-                live_kit_client: this.app_state.live_kit_client.clone(),
+                app_state: this.app_state.clone(),
                 http_client,
-                rate_limiter: this.app_state.rate_limiter.clone(),
+                geoip_country_code,
                 _executor: executor.clone(),
                 supermaven_client,
             };
@@ -1055,7 +785,6 @@ impl Server {
                                 user_id=field::Empty,
                                 login=field::Empty,
                                 impersonator=field::Empty,
-                                dev_server_id=field::Empty
                             );
                             principal.update_span(&span);
                             let span_enter = span.enter();
@@ -1122,11 +851,9 @@ impl Server {
                         .await?;
                 }
 
-                let (contacts, dev_server_projects) = future::try_join(
-                    self.app_state.db.get_contacts(user.id),
-                    self.app_state.db.dev_server_projects_update(user.id),
-                )
-                .await?;
+                update_user_plan(user.id, session).await?;
+
+                let contacts = self.app_state.db.get_contacts(user.id).await?;
 
                 {
                     let mut pool = self.connection_pool.lock();
@@ -1141,48 +868,13 @@ impl Server {
                     subscribe_user_to_channels(user.id, session).await?;
                 }
 
-                send_dev_server_projects_update(user.id, dev_server_projects, session).await;
-
                 if let Some(incoming_call) =
                     self.app_state.db.incoming_call_for_user(user.id).await?
                 {
                     self.peer.send(connection_id, incoming_call)?;
                 }
 
-                update_user_contacts(user.id, &session).await?;
-            }
-            Principal::DevServer(dev_server) => {
-                {
-                    let mut pool = self.connection_pool.lock();
-                    if let Some(stale_connection_id) = pool.dev_server_connection_id(dev_server.id)
-                    {
-                        self.peer.send(
-                            stale_connection_id,
-                            proto::ShutdownDevServer {
-                                reason: Some(
-                                    "another dev server connected with the same token".to_string(),
-                                ),
-                            },
-                        )?;
-                        pool.remove_connection(stale_connection_id)?;
-                    };
-                    pool.add_dev_server(connection_id, dev_server.id, zed_version);
-                }
-
-                let projects = self
-                    .app_state
-                    .db
-                    .get_projects_for_dev_server(dev_server.id)
-                    .await?;
-                self.peer
-                    .send(connection_id, proto::DevServerInstructions { projects })?;
-
-                let status = self
-                    .app_state
-                    .db
-                    .dev_server_projects_update(dev_server.user_id)
-                    .await?;
-                send_dev_server_projects_update(dev_server.user_id, status, &session).await;
+                update_user_contacts(user.id, session).await?;
             }
         }
 
@@ -1238,6 +930,15 @@ impl Server {
             }
         }
         Ok(())
+    }
+
+    pub async fn refresh_llm_tokens_for_user(self: &Arc<Self>, user_id: UserId) {
+        let pool = self.connection_pool.lock();
+        for connection_id in pool.user_connection_ids(user_id) {
+            self.peer
+                .send(connection_id, proto::RefreshLlmToken {})
+                .trace_err();
+        }
     }
 
     pub async fn snapshot<'a>(self: &'a Arc<Self>) -> ServerSnapshot<'a> {
@@ -1361,6 +1062,7 @@ pub async fn handle_websocket_request(
     ConnectInfo(socket_address): ConnectInfo<SocketAddr>,
     Extension(server): Extension<Arc<Server>>,
     Extension(principal): Extension<Principal>,
+    country_code_header: Option<TypedHeader<CloudflareIpCountryHeader>>,
     ws: WebSocketUpgrade,
 ) -> axum::response::Response {
     if protocol_version != rpc::PROTOCOL_VERSION {
@@ -1401,6 +1103,7 @@ pub async fn handle_websocket_request(
                     socket_address,
                     principal,
                     version,
+                    country_code_header.map(|header| header.to_string()),
                     None,
                     Executor::Production,
                 )
@@ -1463,33 +1166,25 @@ async fn connection_lost(
 
     futures::select_biased! {
         _ = executor.sleep(RECONNECT_TIMEOUT).fuse() => {
-            match &session.principal {
-                Principal::User(_) | Principal::Impersonated{ user: _, admin:_ } => {
-                    let session = session.for_user().unwrap();
 
-                    log::info!("connection lost, removing all resources for user:{}, connection:{:?}", session.user_id(), session.connection_id);
-                    leave_room_for_session(&session, session.connection_id).await.trace_err();
-                    leave_channel_buffers_for_session(&session)
-                        .await
-                        .trace_err();
+            log::info!("connection lost, removing all resources for user:{}, connection:{:?}", session.user_id(), session.connection_id);
+            leave_room_for_session(&session, session.connection_id).await.trace_err();
+            leave_channel_buffers_for_session(&session)
+                .await
+                .trace_err();
 
-                    if !session
-                        .connection_pool()
-                        .await
-                        .is_user_online(session.user_id())
-                    {
-                        let db = session.db().await;
-                        if let Some(room) = db.decline_call(None, session.user_id()).await.trace_err().flatten() {
-                            room_updated(&room, &session.peer);
-                        }
-                    }
+            if !session
+                .connection_pool()
+                .await
+                .is_user_online(session.user_id())
+            {
+                let db = session.db().await;
+                if let Some(room) = db.decline_call(None, session.user_id()).await.trace_err().flatten() {
+                    room_updated(&room, &session.peer);
+                }
+            }
 
-                    update_user_contacts(session.user_id(), &session).await?;
-                },
-            Principal::DevServer(_) => {
-                lost_dev_server_connection(&session.for_dev_server().unwrap()).await?;
-            },
-        }
+            update_user_contacts(session.user_id(), &session).await?;
         },
         _ = teardown.changed().fuse() => {}
     }
@@ -1507,12 +1202,12 @@ async fn ping(_: proto::Ping, response: Response<proto::Ping>, _session: Session
 async fn create_room(
     _request: proto::CreateRoom,
     response: Response<proto::CreateRoom>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let live_kit_room = nanoid::nanoid!(30);
 
     let live_kit_connection_info = util::maybe!(async {
-        let live_kit = session.live_kit_client.as_ref();
+        let live_kit = session.app_state.live_kit_client.as_ref();
         let live_kit = live_kit?;
         let user_id = session.user_id().to_string();
 
@@ -1547,7 +1242,7 @@ async fn create_room(
 async fn join_room(
     request: proto::JoinRoom,
     response: Response<proto::JoinRoom>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let room_id = RoomId::from_proto(request.id);
 
@@ -1583,25 +1278,22 @@ async fn join_room(
             .trace_err();
     }
 
-    let live_kit_connection_info = if let Some(live_kit) = session.live_kit_client.as_ref() {
-        if let Some(token) = live_kit
-            .room_token(
-                &joined_room.room.live_kit_room,
-                &session.user_id().to_string(),
-            )
-            .trace_err()
-        {
-            Some(proto::LiveKitConnectionInfo {
-                server_url: live_kit.url().into(),
-                token,
-                can_publish: true,
-            })
+    let live_kit_connection_info =
+        if let Some(live_kit) = session.app_state.live_kit_client.as_ref() {
+            live_kit
+                .room_token(
+                    &joined_room.room.live_kit_room,
+                    &session.user_id().to_string(),
+                )
+                .trace_err()
+                .map(|token| proto::LiveKitConnectionInfo {
+                    server_url: live_kit.url().into(),
+                    token,
+                    can_publish: true,
+                })
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
     response.send(proto::JoinRoomResponse {
         room: Some(joined_room.room),
@@ -1617,7 +1309,7 @@ async fn join_room(
 async fn rejoin_room(
     request: proto::RejoinRoom,
     response: Response<proto::RejoinRoom>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let room;
     let channel;
@@ -1707,7 +1399,7 @@ async fn rejoin_room(
 
 fn notify_rejoined_projects(
     rejoined_projects: &mut Vec<RejoinedProject>,
-    session: &UserSession,
+    session: &Session,
 ) -> Result<()> {
     for project in rejoined_projects.iter() {
         for collaborator in &project.collaborators {
@@ -1727,11 +1419,6 @@ fn notify_rejoined_projects(
 
     for project in rejoined_projects {
         for worktree in mem::take(&mut project.worktrees) {
-            #[cfg(any(test, feature = "test-support"))]
-            const MAX_CHUNK_SIZE: usize = 2;
-            #[cfg(not(any(test, feature = "test-support")))]
-            const MAX_CHUNK_SIZE: usize = 256;
-
             // Stream this worktree's entries.
             let message = proto::UpdateWorktree {
                 project_id: project.id.to_proto(),
@@ -1745,7 +1432,7 @@ fn notify_rejoined_projects(
                 updated_repositories: worktree.updated_repositories,
                 removed_repositories: worktree.removed_repositories,
             };
-            for update in proto::split_worktree_update(message, MAX_CHUNK_SIZE) {
+            for update in proto::split_worktree_update(message) {
                 session.peer.send(session.connection_id, update.clone())?;
             }
 
@@ -1769,6 +1456,7 @@ fn notify_rejoined_projects(
                         worktree_id: worktree.id,
                         path: settings_file.path,
                         content: Some(settings_file.content),
+                        kind: Some(settings_file.kind.to_proto().into()),
                     },
                 )?;
             }
@@ -1796,7 +1484,7 @@ fn notify_rejoined_projects(
 async fn leave_room(
     _: proto::LeaveRoom,
     response: Response<proto::LeaveRoom>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     leave_room_for_session(&session, session.connection_id).await?;
     response.send(proto::Ack {})?;
@@ -1807,7 +1495,7 @@ async fn leave_room(
 async fn set_room_participant_role(
     request: proto::SetRoomParticipantRole,
     response: Response<proto::SetRoomParticipantRole>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let user_id = UserId::from_proto(request.user_id);
     let role = ChannelRole::from(request.role());
@@ -1830,7 +1518,7 @@ async fn set_room_participant_role(
         (live_kit_room, can_publish)
     };
 
-    if let Some(live_kit) = session.live_kit_client.as_ref() {
+    if let Some(live_kit) = session.app_state.live_kit_client.as_ref() {
         live_kit
             .update_participant(
                 live_kit_room.clone(),
@@ -1855,7 +1543,7 @@ async fn set_room_participant_role(
 async fn call(
     request: proto::Call,
     response: Response<proto::Call>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let room_id = RoomId::from_proto(request.room_id);
     let calling_user_id = session.user_id();
@@ -1883,7 +1571,7 @@ async fn call(
                 initial_project_id,
             )
             .await?;
-        room_updated(&room, &session.peer);
+        room_updated(room, &session.peer);
         mem::take(incoming_call)
     };
     update_user_contacts(called_user_id, &session).await?;
@@ -1924,7 +1612,7 @@ async fn call(
 async fn cancel_call(
     request: proto::CancelCall,
     response: Response<proto::CancelCall>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let called_user_id = UserId::from_proto(request.called_user_id);
     let room_id = RoomId::from_proto(request.room_id);
@@ -1959,7 +1647,7 @@ async fn cancel_call(
 }
 
 /// Decline an incoming call.
-async fn decline_call(message: proto::DeclineCall, session: UserSession) -> Result<()> {
+async fn decline_call(message: proto::DeclineCall, session: Session) -> Result<()> {
     let room_id = RoomId::from_proto(message.room_id);
     {
         let room = session
@@ -1994,7 +1682,7 @@ async fn decline_call(message: proto::DeclineCall, session: UserSession) -> Resu
 async fn update_participant_location(
     request: proto::UpdateParticipantLocation,
     response: Response<proto::UpdateParticipantLocation>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let room_id = RoomId::from_proto(request.room_id);
     let location = request
@@ -2015,7 +1703,7 @@ async fn update_participant_location(
 async fn share_project(
     request: proto::ShareProject,
     response: Response<proto::ShareProject>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let (project_id, room) = &*session
         .db()
@@ -2024,15 +1712,13 @@ async fn share_project(
             RoomId::from_proto(request.room_id),
             session.connection_id,
             &request.worktrees,
-            request
-                .dev_server_project_id
-                .map(|id| DevServerProjectId::from_proto(id)),
+            request.is_ssh_project,
         )
         .await?;
     response.send(proto::ShareProjectResponse {
         project_id: project_id.to_proto(),
     })?;
-    room_updated(&room, &session.peer);
+    room_updated(room, &session.peer);
 
     Ok(())
 }
@@ -2040,26 +1726,19 @@ async fn share_project(
 /// Unshare a project from the room.
 async fn unshare_project(message: proto::UnshareProject, session: Session) -> Result<()> {
     let project_id = ProjectId::from_proto(message.project_id);
-    unshare_project_internal(
-        project_id,
-        session.connection_id,
-        session.user_id(),
-        &session,
-    )
-    .await
+    unshare_project_internal(project_id, session.connection_id, &session).await
 }
 
 async fn unshare_project_internal(
     project_id: ProjectId,
     connection_id: ConnectionId,
-    user_id: Option<UserId>,
     session: &Session,
 ) -> Result<()> {
     let delete = {
         let room_guard = session
             .db()
             .await
-            .unshare_project(project_id, connection_id, user_id)
+            .unshare_project(project_id, connection_id)
             .await?;
 
         let (delete, room, guest_connection_ids) = &*room_guard;
@@ -2088,38 +1767,11 @@ async fn unshare_project_internal(
     Ok(())
 }
 
-/// DevServer makes a project available online
-async fn share_dev_server_project(
-    request: proto::ShareDevServerProject,
-    response: Response<proto::ShareDevServerProject>,
-    session: DevServerSession,
-) -> Result<()> {
-    let (dev_server_project, user_id, status) = session
-        .db()
-        .await
-        .share_dev_server_project(
-            DevServerProjectId::from_proto(request.dev_server_project_id),
-            session.dev_server_id(),
-            session.connection_id,
-            &request.worktrees,
-        )
-        .await?;
-    let Some(project_id) = dev_server_project.project_id else {
-        return Err(anyhow!("failed to share remote project"))?;
-    };
-
-    send_dev_server_projects_update(user_id, status, &session).await;
-
-    response.send(proto::ShareProjectResponse { project_id })?;
-
-    Ok(())
-}
-
 /// Join someone elses shared project.
 async fn join_project(
     request: proto::JoinProject,
     response: Response<proto::JoinProject>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let project_id = ProjectId::from_proto(request.project_id);
 
@@ -2142,15 +1794,10 @@ impl JoinProjectInternalResponse for Response<proto::JoinProject> {
         Response::<proto::JoinProject>::send(self, result)
     }
 }
-impl JoinProjectInternalResponse for Response<proto::JoinHostedProject> {
-    fn send(self, result: proto::JoinProjectResponse) -> Result<()> {
-        Response::<proto::JoinHostedProject>::send(self, result)
-    }
-}
 
 fn join_project_internal(
     response: impl JoinProjectInternalResponse,
-    session: UserSession,
+    session: Session,
     project: &mut Project,
     replica_id: &ReplicaId,
 ) -> Result<()> {
@@ -2180,6 +1827,7 @@ fn join_project_internal(
             peer_id: Some(session.connection_id.into()),
             replica_id: replica_id.0 as u32,
             user_id: guest_user_id.to_proto(),
+            is_host: false,
         }),
     };
 
@@ -2201,17 +1849,9 @@ fn join_project_internal(
         collaborators: collaborators.clone(),
         language_servers: project.language_servers.clone(),
         role: project.role.into(),
-        dev_server_project_id: project
-            .dev_server_project_id
-            .map(|dev_server_project_id| dev_server_project_id.0 as u64),
     })?;
 
     for (worktree_id, worktree) in mem::take(&mut project.worktrees) {
-        #[cfg(any(test, feature = "test-support"))]
-        const MAX_CHUNK_SIZE: usize = 2;
-        #[cfg(not(any(test, feature = "test-support")))]
-        const MAX_CHUNK_SIZE: usize = 256;
-
         // Stream this worktree's entries.
         let message = proto::UpdateWorktree {
             project_id: project_id.to_proto(),
@@ -2225,7 +1865,7 @@ fn join_project_internal(
             updated_repositories: worktree.repository_entries.into_values().collect(),
             removed_repositories: Default::default(),
         };
-        for update in proto::split_worktree_update(message, MAX_CHUNK_SIZE) {
+        for update in proto::split_worktree_update(message) {
             session.peer.send(session.connection_id, update.clone())?;
         }
 
@@ -2249,6 +1889,7 @@ fn join_project_internal(
                     worktree_id: worktree.id,
                     path: settings_file.path,
                     content: Some(settings_file.content),
+                    kind: Some(settings_file.kind.to_proto() as i32),
                 },
             )?;
         }
@@ -2273,15 +1914,10 @@ fn join_project_internal(
 }
 
 /// Leave someone elses shared project.
-async fn leave_project(request: proto::LeaveProject, session: UserSession) -> Result<()> {
+async fn leave_project(request: proto::LeaveProject, session: Session) -> Result<()> {
     let sender_id = session.connection_id;
     let project_id = ProjectId::from_proto(request.project_id);
     let db = session.db().await;
-    if db.is_hosted_project(project_id).await? {
-        let project = db.leave_hosted_project(project_id, sender_id).await?;
-        project_left(&project, &session);
-        return Ok(());
-    }
 
     let (room, project) = &*db.leave_project(project_id, sender_id).await?;
     tracing::info!(
@@ -2289,507 +1925,11 @@ async fn leave_project(request: proto::LeaveProject, session: UserSession) -> Re
         "leave project"
     );
 
-    project_left(&project, &session);
+    project_left(project, &session);
     if let Some(room) = room {
-        room_updated(&room, &session.peer);
+        room_updated(room, &session.peer);
     }
 
-    Ok(())
-}
-
-async fn join_hosted_project(
-    request: proto::JoinHostedProject,
-    response: Response<proto::JoinHostedProject>,
-    session: UserSession,
-) -> Result<()> {
-    let (mut project, replica_id) = session
-        .db()
-        .await
-        .join_hosted_project(
-            ProjectId(request.project_id as i32),
-            session.user_id(),
-            session.connection_id,
-        )
-        .await?;
-
-    join_project_internal(response, session, &mut project, &replica_id)
-}
-
-async fn list_remote_directory(
-    request: proto::ListRemoteDirectory,
-    response: Response<proto::ListRemoteDirectory>,
-    session: UserSession,
-) -> Result<()> {
-    let dev_server_id = DevServerId(request.dev_server_id as i32);
-    let dev_server_connection_id = session
-        .connection_pool()
-        .await
-        .dev_server_connection_id_supporting(dev_server_id, ZedVersion::with_list_directory())?;
-
-    session
-        .db()
-        .await
-        .get_dev_server_for_user(dev_server_id, session.user_id())
-        .await?;
-
-    response.send(
-        session
-            .peer
-            .forward_request(session.connection_id, dev_server_connection_id, request)
-            .await?,
-    )?;
-    Ok(())
-}
-
-async fn update_dev_server_project(
-    request: proto::UpdateDevServerProject,
-    response: Response<proto::UpdateDevServerProject>,
-    session: UserSession,
-) -> Result<()> {
-    let dev_server_project_id = DevServerProjectId(request.dev_server_project_id as i32);
-
-    let (dev_server_project, update) = session
-        .db()
-        .await
-        .update_dev_server_project(dev_server_project_id, &request.paths, session.user_id())
-        .await?;
-
-    let projects = session
-        .db()
-        .await
-        .get_projects_for_dev_server(dev_server_project.dev_server_id)
-        .await?;
-
-    let dev_server_connection_id = session
-        .connection_pool()
-        .await
-        .dev_server_connection_id_supporting(
-            dev_server_project.dev_server_id,
-            ZedVersion::with_list_directory(),
-        )?;
-
-    session.peer.send(
-        dev_server_connection_id,
-        proto::DevServerInstructions { projects },
-    )?;
-
-    send_dev_server_projects_update(session.user_id(), update, &session).await;
-
-    response.send(proto::Ack {})
-}
-
-async fn create_dev_server_project(
-    request: proto::CreateDevServerProject,
-    response: Response<proto::CreateDevServerProject>,
-    session: UserSession,
-) -> Result<()> {
-    let dev_server_id = DevServerId(request.dev_server_id as i32);
-    let dev_server_connection_id = session
-        .connection_pool()
-        .await
-        .dev_server_connection_id(dev_server_id);
-    let Some(dev_server_connection_id) = dev_server_connection_id else {
-        Err(ErrorCode::DevServerOffline
-            .message("Cannot create a remote project when the dev server is offline".to_string())
-            .anyhow())?
-    };
-
-    let path = request.path.clone();
-    //Check that the path exists on the dev server
-    session
-        .peer
-        .forward_request(
-            session.connection_id,
-            dev_server_connection_id,
-            proto::ValidateDevServerProjectRequest { path: path.clone() },
-        )
-        .await?;
-
-    let (dev_server_project, update) = session
-        .db()
-        .await
-        .create_dev_server_project(
-            DevServerId(request.dev_server_id as i32),
-            &request.path,
-            session.user_id(),
-        )
-        .await?;
-
-    let projects = session
-        .db()
-        .await
-        .get_projects_for_dev_server(dev_server_project.dev_server_id)
-        .await?;
-
-    session.peer.send(
-        dev_server_connection_id,
-        proto::DevServerInstructions { projects },
-    )?;
-
-    send_dev_server_projects_update(session.user_id(), update, &session).await;
-
-    response.send(proto::CreateDevServerProjectResponse {
-        dev_server_project: Some(dev_server_project.to_proto(None)),
-    })?;
-    Ok(())
-}
-
-async fn create_dev_server(
-    request: proto::CreateDevServer,
-    response: Response<proto::CreateDevServer>,
-    session: UserSession,
-) -> Result<()> {
-    let access_token = auth::random_token();
-    let hashed_access_token = auth::hash_access_token(&access_token);
-
-    if request.name.is_empty() {
-        return Err(proto::ErrorCode::Forbidden
-            .message("Dev server name cannot be empty".to_string())
-            .anyhow())?;
-    }
-
-    let (dev_server, status) = session
-        .db()
-        .await
-        .create_dev_server(
-            &request.name,
-            request.ssh_connection_string.as_deref(),
-            &hashed_access_token,
-            session.user_id(),
-        )
-        .await?;
-
-    send_dev_server_projects_update(session.user_id(), status, &session).await;
-
-    response.send(proto::CreateDevServerResponse {
-        dev_server_id: dev_server.id.0 as u64,
-        access_token: auth::generate_dev_server_token(dev_server.id.0 as usize, access_token),
-        name: request.name,
-    })?;
-    Ok(())
-}
-
-async fn regenerate_dev_server_token(
-    request: proto::RegenerateDevServerToken,
-    response: Response<proto::RegenerateDevServerToken>,
-    session: UserSession,
-) -> Result<()> {
-    let dev_server_id = DevServerId(request.dev_server_id as i32);
-    let access_token = auth::random_token();
-    let hashed_access_token = auth::hash_access_token(&access_token);
-
-    let connection_id = session
-        .connection_pool()
-        .await
-        .dev_server_connection_id(dev_server_id);
-    if let Some(connection_id) = connection_id {
-        shutdown_dev_server_internal(dev_server_id, connection_id, &session).await?;
-        session.peer.send(
-            connection_id,
-            proto::ShutdownDevServer {
-                reason: Some("dev server token was regenerated".to_string()),
-            },
-        )?;
-        let _ = remove_dev_server_connection(dev_server_id, &session).await;
-    }
-
-    let status = session
-        .db()
-        .await
-        .update_dev_server_token(dev_server_id, &hashed_access_token, session.user_id())
-        .await?;
-
-    send_dev_server_projects_update(session.user_id(), status, &session).await;
-
-    response.send(proto::RegenerateDevServerTokenResponse {
-        dev_server_id: dev_server_id.to_proto(),
-        access_token: auth::generate_dev_server_token(dev_server_id.0 as usize, access_token),
-    })?;
-    Ok(())
-}
-
-async fn rename_dev_server(
-    request: proto::RenameDevServer,
-    response: Response<proto::RenameDevServer>,
-    session: UserSession,
-) -> Result<()> {
-    if request.name.trim().is_empty() {
-        return Err(proto::ErrorCode::Forbidden
-            .message("Dev server name cannot be empty".to_string())
-            .anyhow())?;
-    }
-
-    let dev_server_id = DevServerId(request.dev_server_id as i32);
-    let dev_server = session.db().await.get_dev_server(dev_server_id).await?;
-    if dev_server.user_id != session.user_id() {
-        return Err(anyhow!(ErrorCode::Forbidden))?;
-    }
-
-    let status = session
-        .db()
-        .await
-        .rename_dev_server(
-            dev_server_id,
-            &request.name,
-            request.ssh_connection_string.as_deref(),
-            session.user_id(),
-        )
-        .await?;
-
-    send_dev_server_projects_update(session.user_id(), status, &session).await;
-
-    response.send(proto::Ack {})?;
-    Ok(())
-}
-
-async fn delete_dev_server(
-    request: proto::DeleteDevServer,
-    response: Response<proto::DeleteDevServer>,
-    session: UserSession,
-) -> Result<()> {
-    let dev_server_id = DevServerId(request.dev_server_id as i32);
-    let dev_server = session.db().await.get_dev_server(dev_server_id).await?;
-    if dev_server.user_id != session.user_id() {
-        return Err(anyhow!(ErrorCode::Forbidden))?;
-    }
-
-    let connection_id = session
-        .connection_pool()
-        .await
-        .dev_server_connection_id(dev_server_id);
-    if let Some(connection_id) = connection_id {
-        shutdown_dev_server_internal(dev_server_id, connection_id, &session).await?;
-        session.peer.send(
-            connection_id,
-            proto::ShutdownDevServer {
-                reason: Some("dev server was deleted".to_string()),
-            },
-        )?;
-        let _ = remove_dev_server_connection(dev_server_id, &session).await;
-    }
-
-    let status = session
-        .db()
-        .await
-        .delete_dev_server(dev_server_id, session.user_id())
-        .await?;
-
-    send_dev_server_projects_update(session.user_id(), status, &session).await;
-
-    response.send(proto::Ack {})?;
-    Ok(())
-}
-
-async fn delete_dev_server_project(
-    request: proto::DeleteDevServerProject,
-    response: Response<proto::DeleteDevServerProject>,
-    session: UserSession,
-) -> Result<()> {
-    let dev_server_project_id = DevServerProjectId(request.dev_server_project_id as i32);
-    let dev_server_project = session
-        .db()
-        .await
-        .get_dev_server_project(dev_server_project_id)
-        .await?;
-
-    let dev_server = session
-        .db()
-        .await
-        .get_dev_server(dev_server_project.dev_server_id)
-        .await?;
-    if dev_server.user_id != session.user_id() {
-        return Err(anyhow!(ErrorCode::Forbidden))?;
-    }
-
-    let dev_server_connection_id = session
-        .connection_pool()
-        .await
-        .dev_server_connection_id(dev_server.id);
-
-    if let Some(dev_server_connection_id) = dev_server_connection_id {
-        let project = session
-            .db()
-            .await
-            .find_dev_server_project(dev_server_project_id)
-            .await;
-        if let Ok(project) = project {
-            unshare_project_internal(
-                project.id,
-                dev_server_connection_id,
-                Some(session.user_id()),
-                &session,
-            )
-            .await?;
-        }
-    }
-
-    let (projects, status) = session
-        .db()
-        .await
-        .delete_dev_server_project(dev_server_project_id, dev_server.id, session.user_id())
-        .await?;
-
-    if let Some(dev_server_connection_id) = dev_server_connection_id {
-        session.peer.send(
-            dev_server_connection_id,
-            proto::DevServerInstructions { projects },
-        )?;
-    }
-
-    send_dev_server_projects_update(session.user_id(), status, &session).await;
-
-    response.send(proto::Ack {})?;
-    Ok(())
-}
-
-async fn rejoin_dev_server_projects(
-    request: proto::RejoinRemoteProjects,
-    response: Response<proto::RejoinRemoteProjects>,
-    session: UserSession,
-) -> Result<()> {
-    let mut rejoined_projects = {
-        let db = session.db().await;
-        db.rejoin_dev_server_projects(
-            &request.rejoined_projects,
-            session.user_id(),
-            session.0.connection_id,
-        )
-        .await?
-    };
-    response.send(proto::RejoinRemoteProjectsResponse {
-        rejoined_projects: rejoined_projects
-            .iter()
-            .map(|project| project.to_proto())
-            .collect(),
-    })?;
-    notify_rejoined_projects(&mut rejoined_projects, &session)
-}
-
-async fn reconnect_dev_server(
-    request: proto::ReconnectDevServer,
-    response: Response<proto::ReconnectDevServer>,
-    session: DevServerSession,
-) -> Result<()> {
-    let reshared_projects = {
-        let db = session.db().await;
-        db.reshare_dev_server_projects(
-            &request.reshared_projects,
-            session.dev_server_id(),
-            session.0.connection_id,
-        )
-        .await?
-    };
-
-    for project in &reshared_projects {
-        for collaborator in &project.collaborators {
-            session
-                .peer
-                .send(
-                    collaborator.connection_id,
-                    proto::UpdateProjectCollaborator {
-                        project_id: project.id.to_proto(),
-                        old_peer_id: Some(project.old_connection_id.into()),
-                        new_peer_id: Some(session.connection_id.into()),
-                    },
-                )
-                .trace_err();
-        }
-
-        broadcast(
-            Some(session.connection_id),
-            project
-                .collaborators
-                .iter()
-                .map(|collaborator| collaborator.connection_id),
-            |connection_id| {
-                session.peer.forward_send(
-                    session.connection_id,
-                    connection_id,
-                    proto::UpdateProject {
-                        project_id: project.id.to_proto(),
-                        worktrees: project.worktrees.clone(),
-                    },
-                )
-            },
-        );
-    }
-
-    response.send(proto::ReconnectDevServerResponse {
-        reshared_projects: reshared_projects
-            .iter()
-            .map(|project| proto::ResharedProject {
-                id: project.id.to_proto(),
-                collaborators: project
-                    .collaborators
-                    .iter()
-                    .map(|collaborator| collaborator.to_proto())
-                    .collect(),
-            })
-            .collect(),
-    })?;
-
-    Ok(())
-}
-
-async fn shutdown_dev_server(
-    _: proto::ShutdownDevServer,
-    response: Response<proto::ShutdownDevServer>,
-    session: DevServerSession,
-) -> Result<()> {
-    response.send(proto::Ack {})?;
-    shutdown_dev_server_internal(session.dev_server_id(), session.connection_id, &session).await?;
-    remove_dev_server_connection(session.dev_server_id(), &session).await
-}
-
-async fn shutdown_dev_server_internal(
-    dev_server_id: DevServerId,
-    connection_id: ConnectionId,
-    session: &Session,
-) -> Result<()> {
-    let (dev_server_projects, dev_server) = {
-        let db = session.db().await;
-        let dev_server_projects = db.get_projects_for_dev_server(dev_server_id).await?;
-        let dev_server = db.get_dev_server(dev_server_id).await?;
-        (dev_server_projects, dev_server)
-    };
-
-    for project_id in dev_server_projects.iter().filter_map(|p| p.project_id) {
-        unshare_project_internal(
-            ProjectId::from_proto(project_id),
-            connection_id,
-            None,
-            session,
-        )
-        .await?;
-    }
-
-    session
-        .connection_pool()
-        .await
-        .set_dev_server_offline(dev_server_id);
-
-    let status = session
-        .db()
-        .await
-        .dev_server_projects_update(dev_server.user_id)
-        .await?;
-    send_dev_server_projects_update(dev_server.user_id, status, &session).await;
-
-    Ok(())
-}
-
-async fn remove_dev_server_connection(dev_server_id: DevServerId, session: &Session) -> Result<()> {
-    let dev_server_connection = session
-        .connection_pool()
-        .await
-        .dev_server_connection_id(dev_server_id);
-
-    if let Some(dev_server_connection) = dev_server_connection {
-        session
-            .connection_pool()
-            .await
-            .remove_connection(dev_server_connection)?;
-    }
     Ok(())
 }
 
@@ -2815,7 +1955,7 @@ async fn update_project(
         },
     );
     if let Some(room) = room {
-        room_updated(&room, &session.peer);
+        room_updated(room, &session.peer);
     }
     response.send(proto::Ack {})?;
 
@@ -2946,7 +2086,7 @@ async fn update_language_server(
 async fn forward_read_only_project_request<T>(
     request: T,
     response: Response<T>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()>
 where
     T: EntityMessage + RequestMessage,
@@ -2955,7 +2095,7 @@ where
     let host_connection_id = session
         .db()
         .await
-        .host_for_read_only_project_request(project_id, session.connection_id, session.user_id())
+        .host_for_read_only_project_request(project_id, session.connection_id)
         .await?;
     let payload = session
         .peer
@@ -2965,22 +2105,16 @@ where
     Ok(())
 }
 
-/// forward a project request to the dev server. Only allowed
-/// if it's your dev server.
-async fn forward_project_request_for_owner<T>(
-    request: T,
-    response: Response<T>,
-    session: UserSession,
-) -> Result<()>
-where
-    T: EntityMessage + RequestMessage,
-{
+async fn forward_find_search_candidates_request(
+    request: proto::FindSearchCandidates,
+    response: Response<proto::FindSearchCandidates>,
+    session: Session,
+) -> Result<()> {
     let project_id = ProjectId::from_proto(request.remote_entity_id());
-
     let host_connection_id = session
         .db()
         .await
-        .host_for_owner_project_request(project_id, session.connection_id, session.user_id())
+        .host_for_read_only_project_request(project_id, session.connection_id)
         .await?;
     let payload = session
         .peer
@@ -2995,7 +2129,7 @@ where
 async fn forward_mutating_project_request<T>(
     request: T,
     response: Response<T>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()>
 where
     T: EntityMessage + RequestMessage,
@@ -3005,47 +2139,8 @@ where
     let host_connection_id = session
         .db()
         .await
-        .host_for_mutating_project_request(project_id, session.connection_id, session.user_id())
+        .host_for_mutating_project_request(project_id, session.connection_id)
         .await?;
-    let payload = session
-        .peer
-        .forward_request(session.connection_id, host_connection_id, request)
-        .await?;
-    response.send(payload)?;
-    Ok(())
-}
-
-/// forward a project request to the host. These requests are disallowed
-/// for guests.
-async fn forward_versioned_mutating_project_request<T>(
-    request: T,
-    response: Response<T>,
-    session: UserSession,
-) -> Result<()>
-where
-    T: EntityMessage + RequestMessage + VersionedMessage,
-{
-    let project_id = ProjectId::from_proto(request.remote_entity_id());
-
-    let host_connection_id = session
-        .db()
-        .await
-        .host_for_mutating_project_request(project_id, session.connection_id, session.user_id())
-        .await?;
-    if let Some(host_version) = session
-        .connection_pool()
-        .await
-        .connection(host_connection_id)
-        .map(|c| c.zed_version)
-    {
-        if let Some(min_required_version) = request.required_host_version() {
-            if min_required_version > host_version {
-                return Err(anyhow!(ErrorCode::RemoteUpgradeRequired
-                    .with_tag("required", &min_required_version.to_string())))?;
-            }
-        }
-    }
-
     let payload = session
         .peer
         .forward_request(session.connection_id, host_connection_id, request)
@@ -3095,12 +2190,7 @@ async fn update_buffer(
         let guard = session
             .db()
             .await
-            .connections_for_buffer_update(
-                project_id,
-                session.principal_id(),
-                session.connection_id,
-                capability,
-            )
+            .connections_for_buffer_update(project_id, session.connection_id, capability)
             .await?;
 
         let (host, guests) = &*guard;
@@ -3153,12 +2243,7 @@ async fn update_context(message: proto::UpdateContext, session: Session) -> Resu
     let guard = session
         .db()
         .await
-        .connections_for_buffer_update(
-            project_id,
-            session.principal_id(),
-            session.connection_id,
-            capability,
-        )
+        .connections_for_buffer_update(project_id, session.connection_id, capability)
         .await?;
 
     let (host, guests) = &*guard;
@@ -3204,7 +2289,7 @@ async fn broadcast_project_message_from_host<T: EntityMessage<Entity = ShareProj
 async fn follow(
     request: proto::Follow,
     response: Response<proto::Follow>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let room_id = RoomId::from_proto(request.room_id);
     let project_id = request.project_id.map(ProjectId::from_proto);
@@ -3239,7 +2324,7 @@ async fn follow(
 }
 
 /// Stop following another user in a call.
-async fn unfollow(request: proto::Unfollow, session: UserSession) -> Result<()> {
+async fn unfollow(request: proto::Unfollow, session: Session) -> Result<()> {
     let room_id = RoomId::from_proto(request.room_id);
     let project_id = request.project_id.map(ProjectId::from_proto);
     let leader_id = request
@@ -3271,7 +2356,7 @@ async fn unfollow(request: proto::Unfollow, session: UserSession) -> Result<()> 
 }
 
 /// Notify everyone following you of your current location.
-async fn update_followers(request: proto::UpdateFollowers, session: UserSession) -> Result<()> {
+async fn update_followers(request: proto::UpdateFollowers, session: Session) -> Result<()> {
     let room_id = RoomId::from_proto(request.room_id);
     let database = session.db.lock().await;
 
@@ -3333,7 +2418,7 @@ async fn get_users(
 async fn fuzzy_search_users(
     request: proto::FuzzySearchUsers,
     response: Response<proto::FuzzySearchUsers>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let query = request.query;
     let users = match query.len() {
@@ -3364,7 +2449,7 @@ async fn fuzzy_search_users(
 async fn request_contact(
     request: proto::RequestContact,
     response: Response<proto::RequestContact>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let requester_id = session.user_id();
     let responder_id = UserId::from_proto(request.responder_id);
@@ -3411,7 +2496,7 @@ async fn request_contact(
 async fn respond_to_contact_request(
     request: proto::RespondToContactRequest,
     response: Response<proto::RespondToContactRequest>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let responder_id = session.user_id();
     let requester_id = UserId::from_proto(request.requester_id);
@@ -3469,7 +2554,7 @@ async fn respond_to_contact_request(
 async fn remove_contact(
     request: proto::RemoveContact,
     response: Response<proto::RemoveContact>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let requester_id = session.user_id();
     let responder_id = UserId::from_proto(request.user_id);
@@ -3520,12 +2605,22 @@ fn should_auto_subscribe_to_channels(version: ZedVersion) -> bool {
     version.0.minor() < 139
 }
 
+async fn update_user_plan(_user_id: UserId, session: &Session) -> Result<()> {
+    let plan = session.current_plan(&session.db().await).await?;
+
+    session
+        .peer
+        .send(
+            session.connection_id,
+            proto::UpdateUserPlan { plan: plan.into() },
+        )
+        .trace_err();
+
+    Ok(())
+}
+
 async fn subscribe_to_channels(_: proto::SubscribeToChannels, session: Session) -> Result<()> {
-    subscribe_user_to_channels(
-        session.user_id().ok_or_else(|| anyhow!("must be a user"))?,
-        &session,
-    )
-    .await?;
+    subscribe_user_to_channels(session.user_id(), &session).await?;
     Ok(())
 }
 
@@ -3550,11 +2645,11 @@ async fn subscribe_user_to_channels(user_id: UserId, session: &Session) -> Resul
 async fn create_channel(
     request: proto::CreateChannel,
     response: Response<proto::CreateChannel>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
 
-    let parent_id = request.parent_id.map(|id| ChannelId::from_proto(id));
+    let parent_id = request.parent_id.map(ChannelId::from_proto);
     let (channel, membership) = db
         .create_channel(&request.name, parent_id, session.user_id())
         .await?;
@@ -3605,7 +2700,7 @@ async fn create_channel(
 async fn delete_channel(
     request: proto::DeleteChannel,
     response: Response<proto::DeleteChannel>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
 
@@ -3633,7 +2728,7 @@ async fn delete_channel(
 async fn invite_channel_member(
     request: proto::InviteChannelMember,
     response: Response<proto::InviteChannelMember>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let channel_id = ChannelId::from_proto(request.channel_id);
@@ -3670,7 +2765,7 @@ async fn invite_channel_member(
 async fn remove_channel_member(
     request: proto::RemoveChannelMember,
     response: Response<proto::RemoveChannelMember>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let channel_id = ChannelId::from_proto(request.channel_id);
@@ -3714,7 +2809,7 @@ async fn remove_channel_member(
 async fn set_channel_visibility(
     request: proto::SetChannelVisibility,
     response: Response<proto::SetChannelVisibility>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let channel_id = ChannelId::from_proto(request.channel_id);
@@ -3759,7 +2854,7 @@ async fn set_channel_visibility(
 async fn set_channel_member_role(
     request: proto::SetChannelMemberRole,
     response: Response<proto::SetChannelMemberRole>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let channel_id = ChannelId::from_proto(request.channel_id);
@@ -3807,7 +2902,7 @@ async fn set_channel_member_role(
 async fn rename_channel(
     request: proto::RenameChannel,
     response: Response<proto::RenameChannel>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let channel_id = ChannelId::from_proto(request.channel_id);
@@ -3839,7 +2934,7 @@ async fn rename_channel(
 async fn move_channel(
     request: proto::MoveChannel,
     response: Response<proto::MoveChannel>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let channel_id = ChannelId::from_proto(request.channel_id);
     let to = ChannelId::from_proto(request.to);
@@ -3882,7 +2977,7 @@ async fn move_channel(
 async fn get_channel_members(
     request: proto::GetChannelMembers,
     response: Response<proto::GetChannelMembers>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let channel_id = ChannelId::from_proto(request.channel_id);
@@ -3902,7 +2997,7 @@ async fn get_channel_members(
 async fn respond_to_channel_invite(
     request: proto::RespondToChannelInvite,
     response: Response<proto::RespondToChannelInvite>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let channel_id = ChannelId::from_proto(request.channel_id);
@@ -3943,7 +3038,7 @@ async fn respond_to_channel_invite(
 async fn join_channel(
     request: proto::JoinChannel,
     response: Response<proto::JoinChannel>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let channel_id = ChannelId::from_proto(request.channel_id);
     join_channel_internal(channel_id, Box::new(response), session).await
@@ -3966,7 +3061,7 @@ impl JoinChannelInternalResponse for Response<proto::JoinRoom> {
 async fn join_channel_internal(
     channel_id: ChannelId,
     response: Box<impl JoinChannelInternalResponse>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let joined_room = {
         let mut db = session.db().await;
@@ -3987,35 +3082,40 @@ async fn join_channel_internal(
             .join_channel(channel_id, session.user_id(), session.connection_id)
             .await?;
 
-        let live_kit_connection_info = session.live_kit_client.as_ref().and_then(|live_kit| {
-            let (can_publish, token) = if role == ChannelRole::Guest {
-                (
-                    false,
-                    live_kit
-                        .guest_token(
-                            &joined_room.room.live_kit_room,
-                            &session.user_id().to_string(),
+        let live_kit_connection_info =
+            session
+                .app_state
+                .live_kit_client
+                .as_ref()
+                .and_then(|live_kit| {
+                    let (can_publish, token) = if role == ChannelRole::Guest {
+                        (
+                            false,
+                            live_kit
+                                .guest_token(
+                                    &joined_room.room.live_kit_room,
+                                    &session.user_id().to_string(),
+                                )
+                                .trace_err()?,
                         )
-                        .trace_err()?,
-                )
-            } else {
-                (
-                    true,
-                    live_kit
-                        .room_token(
-                            &joined_room.room.live_kit_room,
-                            &session.user_id().to_string(),
+                    } else {
+                        (
+                            true,
+                            live_kit
+                                .room_token(
+                                    &joined_room.room.live_kit_room,
+                                    &session.user_id().to_string(),
+                                )
+                                .trace_err()?,
                         )
-                        .trace_err()?,
-                )
-            };
+                    };
 
-            Some(LiveKitConnectionInfo {
-                server_url: live_kit.url().into(),
-                token,
-                can_publish,
-            })
-        });
+                    Some(LiveKitConnectionInfo {
+                        server_url: live_kit.url().into(),
+                        token,
+                        can_publish,
+                    })
+                });
 
         response.send(proto::JoinRoomResponse {
             room: Some(joined_room.room.clone()),
@@ -4058,7 +3158,7 @@ async fn join_channel_internal(
 async fn join_channel_buffer(
     request: proto::JoinChannelBuffer,
     response: Response<proto::JoinChannelBuffer>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let channel_id = ChannelId::from_proto(request.channel_id);
@@ -4089,7 +3189,7 @@ async fn join_channel_buffer(
 /// Edit the channel notes
 async fn update_channel_buffer(
     request: proto::UpdateChannelBuffer,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let channel_id = ChannelId::from_proto(request.channel_id);
@@ -4141,7 +3241,7 @@ async fn update_channel_buffer(
 async fn rejoin_channel_buffers(
     request: proto::RejoinChannelBuffers,
     response: Response<proto::RejoinChannelBuffers>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let buffers = db
@@ -4176,7 +3276,7 @@ async fn rejoin_channel_buffers(
 async fn leave_channel_buffer(
     request: proto::LeaveChannelBuffer,
     response: Response<proto::LeaveChannelBuffer>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
     let channel_id = ChannelId::from_proto(request.channel_id);
@@ -4238,7 +3338,7 @@ fn send_notifications(
 async fn send_channel_message(
     request: proto::SendChannelMessage,
     response: Response<proto::SendChannelMessage>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     // Validate the message body.
     let body = request.body.trim().to_string();
@@ -4271,10 +3371,7 @@ async fn send_channel_message(
             &request.mentions,
             timestamp,
             nonce.clone().into(),
-            match request.reply_to_message_id {
-                Some(reply_to_message_id) => Some(MessageId::from_proto(reply_to_message_id)),
-                None => None,
-            },
+            request.reply_to_message_id.map(MessageId::from_proto),
         )
         .await?;
 
@@ -4336,7 +3433,7 @@ async fn send_channel_message(
 async fn remove_channel_message(
     request: proto::RemoveChannelMessage,
     response: Response<proto::RemoveChannelMessage>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let channel_id = ChannelId::from_proto(request.channel_id);
     let message_id = MessageId::from_proto(request.message_id);
@@ -4371,7 +3468,7 @@ async fn remove_channel_message(
 async fn update_channel_message(
     request: proto::UpdateChannelMessage,
     response: Response<proto::UpdateChannelMessage>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let channel_id = ChannelId::from_proto(request.channel_id);
     let message_id = MessageId::from_proto(request.message_id);
@@ -4458,7 +3555,7 @@ async fn update_channel_message(
 /// Mark a channel message as read
 async fn acknowledge_channel_message(
     request: proto::AckChannelMessage,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let channel_id = ChannelId::from_proto(request.channel_id);
     let message_id = MessageId::from_proto(request.message_id);
@@ -4478,7 +3575,7 @@ async fn acknowledge_channel_message(
 /// Mark a buffer version as synced
 async fn acknowledge_buffer_version(
     request: proto::AckBufferOperation,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let buffer_id = BufferId::from_proto(request.buffer_id);
     session
@@ -4494,410 +3591,144 @@ async fn acknowledge_buffer_version(
     Ok(())
 }
 
-struct CompleteWithLanguageModelRateLimit;
-
-impl RateLimit for CompleteWithLanguageModelRateLimit {
-    fn capacity() -> usize {
-        std::env::var("COMPLETE_WITH_LANGUAGE_MODEL_RATE_LIMIT_PER_HOUR")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120) // Picked arbitrarily
-    }
-
-    fn refill_duration() -> chrono::Duration {
-        chrono::Duration::hours(1)
-    }
-
-    fn db_name() -> &'static str {
-        "complete-with-language-model"
-    }
-}
-
-async fn complete_with_language_model(
-    mut request: proto::CompleteWithLanguageModel,
-    response: StreamingResponse<proto::CompleteWithLanguageModel>,
+async fn count_language_model_tokens(
+    request: proto::CountLanguageModelTokens,
+    response: Response<proto::CountLanguageModelTokens>,
     session: Session,
-    open_ai_api_key: Option<Arc<str>>,
-    google_ai_api_key: Option<Arc<str>>,
-    anthropic_api_key: Option<Arc<str>>,
+    config: &Config,
 ) -> Result<()> {
-    let Some(session) = session.for_user() else {
-        return Err(anyhow!("user not found"))?;
+    authorize_access_to_legacy_llm_endpoints(&session).await?;
+
+    let rate_limit: Box<dyn RateLimit> = match session.current_plan(&session.db().await).await? {
+        proto::Plan::ZedPro => Box::new(ZedProCountLanguageModelTokensRateLimit),
+        proto::Plan::Free => Box::new(FreeCountLanguageModelTokensRateLimit),
     };
-    authorize_access_to_language_models(&session).await?;
+
     session
+        .app_state
         .rate_limiter
-        .check::<CompleteWithLanguageModelRateLimit>(session.user_id())
+        .check(&*rate_limit, session.user_id())
         .await?;
 
-    let mut provider_and_model = request.model.split('/');
-    let (provider, model) = match (
-        provider_and_model.next().unwrap(),
-        provider_and_model.next(),
-    ) {
-        (provider, Some(model)) => (provider, model),
-        (model, None) => {
-            if model.starts_with("gpt") {
-                ("openai", model)
-            } else if model.starts_with("gemini") {
-                ("google", model)
-            } else if model.starts_with("claude") {
-                ("anthropic", model)
-            } else {
-                ("unknown", model)
-            }
+    let result = match proto::LanguageModelProvider::from_i32(request.provider) {
+        Some(proto::LanguageModelProvider::Google) => {
+            let api_key = config
+                .google_ai_api_key
+                .as_ref()
+                .context("no Google AI API key configured on the server")?;
+            google_ai::count_tokens(
+                session.http_client.as_ref(),
+                google_ai::API_URL,
+                api_key,
+                serde_json::from_str(&request.request)?,
+                None,
+            )
+            .await?
         }
+        _ => return Err(anyhow!("unsupported provider"))?,
     };
-    let provider = provider.to_string();
-    request.model = model.to_string();
 
-    match provider.as_str() {
-        "openai" => {
-            let api_key = open_ai_api_key.context("no OpenAI API key configured on the server")?;
-            complete_with_open_ai(request, response, session, api_key).await?;
-        }
-        "anthropic" => {
-            let api_key =
-                anthropic_api_key.context("no Anthropic AI API key configured on the server")?;
-            complete_with_anthropic(request, response, session, api_key).await?;
-        }
-        "google" => {
-            let api_key =
-                google_ai_api_key.context("no Google AI API key configured on the server")?;
-            complete_with_google_ai(request, response, session, api_key).await?;
-        }
-        provider => return Err(anyhow!("unknown provider {:?}", provider))?,
-    }
+    response.send(proto::CountLanguageModelTokensResponse {
+        token_count: result.total_tokens as u32,
+    })?;
 
     Ok(())
 }
 
-async fn complete_with_open_ai(
-    request: proto::CompleteWithLanguageModel,
-    response: StreamingResponse<proto::CompleteWithLanguageModel>,
-    session: UserSession,
-    api_key: Arc<str>,
-) -> Result<()> {
-    let mut completion_stream = open_ai::stream_completion(
-        session.http_client.as_ref(),
-        OPEN_AI_API_URL,
-        &api_key,
-        crate::ai::language_model_request_to_open_ai(request)?,
-        None,
-    )
-    .await
-    .context("open_ai::stream_completion request failed within collab")?;
+struct ZedProCountLanguageModelTokensRateLimit;
 
-    while let Some(event) = completion_stream.next().await {
-        let event = event?;
-        response.send(proto::LanguageModelResponse {
-            choices: event
-                .choices
-                .into_iter()
-                .map(|choice| proto::LanguageModelChoiceDelta {
-                    index: choice.index,
-                    delta: Some(proto::LanguageModelResponseMessage {
-                        role: choice.delta.role.map(|role| match role {
-                            open_ai::Role::User => LanguageModelRole::LanguageModelUser,
-                            open_ai::Role::Assistant => LanguageModelRole::LanguageModelAssistant,
-                            open_ai::Role::System => LanguageModelRole::LanguageModelSystem,
-                            open_ai::Role::Tool => LanguageModelRole::LanguageModelTool,
-                        } as i32),
-                        content: choice.delta.content,
-                        tool_calls: choice
-                            .delta
-                            .tool_calls
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|delta| proto::ToolCallDelta {
-                                index: delta.index as u32,
-                                id: delta.id,
-                                variant: match delta.function {
-                                    Some(function) => {
-                                        let name = function.name;
-                                        let arguments = function.arguments;
-
-                                        Some(proto::tool_call_delta::Variant::Function(
-                                            proto::tool_call_delta::FunctionCallDelta {
-                                                name,
-                                                arguments,
-                                            },
-                                        ))
-                                    }
-                                    None => None,
-                                },
-                            })
-                            .collect(),
-                    }),
-                    finish_reason: choice.finish_reason,
-                })
-                .collect(),
-        })?;
-    }
-
-    Ok(())
-}
-
-async fn complete_with_google_ai(
-    request: proto::CompleteWithLanguageModel,
-    response: StreamingResponse<proto::CompleteWithLanguageModel>,
-    session: UserSession,
-    api_key: Arc<str>,
-) -> Result<()> {
-    let mut stream = google_ai::stream_generate_content(
-        session.http_client.clone(),
-        google_ai::API_URL,
-        api_key.as_ref(),
-        &request.model.clone(),
-        crate::ai::language_model_request_to_google_ai(request)?,
-    )
-    .await
-    .context("google_ai::stream_generate_content request failed")?;
-
-    while let Some(event) = stream.next().await {
-        let event = event?;
-        response.send(proto::LanguageModelResponse {
-            choices: event
-                .candidates
-                .unwrap_or_default()
-                .into_iter()
-                .map(|candidate| proto::LanguageModelChoiceDelta {
-                    index: candidate.index as u32,
-                    delta: Some(proto::LanguageModelResponseMessage {
-                        role: Some(match candidate.content.role {
-                            google_ai::Role::User => LanguageModelRole::LanguageModelUser,
-                            google_ai::Role::Model => LanguageModelRole::LanguageModelAssistant,
-                        } as i32),
-                        content: Some(
-                            candidate
-                                .content
-                                .parts
-                                .into_iter()
-                                .filter_map(|part| match part {
-                                    google_ai::Part::TextPart(part) => Some(part.text),
-                                    google_ai::Part::InlineDataPart(_) => None,
-                                })
-                                .collect(),
-                        ),
-                        // Tool calls are not supported for Google
-                        tool_calls: Vec::new(),
-                    }),
-                    finish_reason: candidate.finish_reason.map(|reason| reason.to_string()),
-                })
-                .collect(),
-        })?;
-    }
-
-    Ok(())
-}
-
-async fn complete_with_anthropic(
-    request: proto::CompleteWithLanguageModel,
-    response: StreamingResponse<proto::CompleteWithLanguageModel>,
-    session: UserSession,
-    api_key: Arc<str>,
-) -> Result<()> {
-    let model = anthropic::Model::from_id(&request.model)?;
-
-    let mut system_message = String::new();
-    let messages = request
-        .messages
-        .into_iter()
-        .filter_map(|message| {
-            match message.role() {
-                LanguageModelRole::LanguageModelUser => Some(anthropic::RequestMessage {
-                    role: anthropic::Role::User,
-                    content: message.content,
-                }),
-                LanguageModelRole::LanguageModelAssistant => Some(anthropic::RequestMessage {
-                    role: anthropic::Role::Assistant,
-                    content: message.content,
-                }),
-                // Anthropic's API breaks system instructions out as a separate field rather
-                // than having a system message role.
-                LanguageModelRole::LanguageModelSystem => {
-                    if !system_message.is_empty() {
-                        system_message.push_str("\n\n");
-                    }
-                    system_message.push_str(&message.content);
-
-                    None
-                }
-                // We don't yet support tool calls for Anthropic
-                LanguageModelRole::LanguageModelTool => None,
-            }
-        })
-        .collect();
-
-    let mut stream = anthropic::stream_completion(
-        session.http_client.as_ref(),
-        anthropic::ANTHROPIC_API_URL,
-        &api_key,
-        anthropic::Request {
-            model,
-            messages,
-            stream: true,
-            system: system_message,
-            max_tokens: 4092,
-        },
-        None,
-    )
-    .await?;
-
-    let mut current_role = proto::LanguageModelRole::LanguageModelAssistant;
-
-    while let Some(event) = stream.next().await {
-        let event = event?;
-
-        match event {
-            anthropic::ResponseEvent::MessageStart { message } => {
-                if let Some(role) = message.role {
-                    if role == "assistant" {
-                        current_role = proto::LanguageModelRole::LanguageModelAssistant;
-                    } else if role == "user" {
-                        current_role = proto::LanguageModelRole::LanguageModelUser;
-                    }
-                }
-            }
-            anthropic::ResponseEvent::ContentBlockStart { content_block, .. } => {
-                match content_block {
-                    anthropic::ContentBlock::Text { text } => {
-                        if !text.is_empty() {
-                            response.send(proto::LanguageModelResponse {
-                                choices: vec![proto::LanguageModelChoiceDelta {
-                                    index: 0,
-                                    delta: Some(proto::LanguageModelResponseMessage {
-                                        role: Some(current_role as i32),
-                                        content: Some(text),
-                                        tool_calls: Vec::new(),
-                                    }),
-                                    finish_reason: None,
-                                }],
-                            })?;
-                        }
-                    }
-                }
-            }
-            anthropic::ResponseEvent::ContentBlockDelta { delta, .. } => match delta {
-                anthropic::TextDelta::TextDelta { text } => {
-                    response.send(proto::LanguageModelResponse {
-                        choices: vec![proto::LanguageModelChoiceDelta {
-                            index: 0,
-                            delta: Some(proto::LanguageModelResponseMessage {
-                                role: Some(current_role as i32),
-                                content: Some(text),
-                                tool_calls: Vec::new(),
-                            }),
-                            finish_reason: None,
-                        }],
-                    })?;
-                }
-            },
-            anthropic::ResponseEvent::MessageDelta { delta, .. } => {
-                if let Some(stop_reason) = delta.stop_reason {
-                    response.send(proto::LanguageModelResponse {
-                        choices: vec![proto::LanguageModelChoiceDelta {
-                            index: 0,
-                            delta: None,
-                            finish_reason: Some(stop_reason),
-                        }],
-                    })?;
-                }
-            }
-            anthropic::ResponseEvent::ContentBlockStop { .. } => {}
-            anthropic::ResponseEvent::MessageStop {} => {}
-            anthropic::ResponseEvent::Ping {} => {}
-        }
-    }
-
-    Ok(())
-}
-
-struct CountTokensWithLanguageModelRateLimit;
-
-impl RateLimit for CountTokensWithLanguageModelRateLimit {
-    fn capacity() -> usize {
-        std::env::var("COUNT_TOKENS_WITH_LANGUAGE_MODEL_RATE_LIMIT_PER_HOUR")
+impl RateLimit for ZedProCountLanguageModelTokensRateLimit {
+    fn capacity(&self) -> usize {
+        std::env::var("COUNT_LANGUAGE_MODEL_TOKENS_RATE_LIMIT_PER_HOUR")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(600) // Picked arbitrarily
     }
 
-    fn refill_duration() -> chrono::Duration {
+    fn refill_duration(&self) -> chrono::Duration {
         chrono::Duration::hours(1)
     }
 
-    fn db_name() -> &'static str {
-        "count-tokens-with-language-model"
+    fn db_name(&self) -> &'static str {
+        "zed-pro:count-language-model-tokens"
     }
 }
 
-async fn count_tokens_with_language_model(
-    request: proto::CountTokensWithLanguageModel,
-    response: Response<proto::CountTokensWithLanguageModel>,
-    session: UserSession,
-    google_ai_api_key: Option<Arc<str>>,
-) -> Result<()> {
-    authorize_access_to_language_models(&session).await?;
+struct FreeCountLanguageModelTokensRateLimit;
 
-    if !request.model.starts_with("gemini") {
-        return Err(anyhow!(
-            "counting tokens for model: {:?} is not supported",
-            request.model
-        ))?;
+impl RateLimit for FreeCountLanguageModelTokensRateLimit {
+    fn capacity(&self) -> usize {
+        std::env::var("COUNT_LANGUAGE_MODEL_TOKENS_RATE_LIMIT_PER_HOUR_FREE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600 / 10) // Picked arbitrarily
     }
 
-    session
-        .rate_limiter
-        .check::<CountTokensWithLanguageModelRateLimit>(session.user_id())
-        .await?;
+    fn refill_duration(&self) -> chrono::Duration {
+        chrono::Duration::hours(1)
+    }
 
-    let api_key = google_ai_api_key
-        .ok_or_else(|| anyhow!("no Google AI API key configured on the server"))?;
-    let tokens_response = google_ai::count_tokens(
-        session.http_client.as_ref(),
-        google_ai::API_URL,
-        &api_key,
-        crate::ai::count_tokens_request_to_google_ai(request)?,
-    )
-    .await?;
-    response.send(proto::CountTokensResponse {
-        token_count: tokens_response.total_tokens as u32,
-    })?;
-    Ok(())
+    fn db_name(&self) -> &'static str {
+        "free:count-language-model-tokens"
+    }
 }
 
-struct ComputeEmbeddingsRateLimit;
+struct ZedProComputeEmbeddingsRateLimit;
 
-impl RateLimit for ComputeEmbeddingsRateLimit {
-    fn capacity() -> usize {
+impl RateLimit for ZedProComputeEmbeddingsRateLimit {
+    fn capacity(&self) -> usize {
         std::env::var("EMBED_TEXTS_RATE_LIMIT_PER_HOUR")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(5000) // Picked arbitrarily
     }
 
-    fn refill_duration() -> chrono::Duration {
+    fn refill_duration(&self) -> chrono::Duration {
         chrono::Duration::hours(1)
     }
 
-    fn db_name() -> &'static str {
-        "compute-embeddings"
+    fn db_name(&self) -> &'static str {
+        "zed-pro:compute-embeddings"
+    }
+}
+
+struct FreeComputeEmbeddingsRateLimit;
+
+impl RateLimit for FreeComputeEmbeddingsRateLimit {
+    fn capacity(&self) -> usize {
+        std::env::var("EMBED_TEXTS_RATE_LIMIT_PER_HOUR_FREE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5000 / 10) // Picked arbitrarily
+    }
+
+    fn refill_duration(&self) -> chrono::Duration {
+        chrono::Duration::hours(1)
+    }
+
+    fn db_name(&self) -> &'static str {
+        "free:compute-embeddings"
     }
 }
 
 async fn compute_embeddings(
     request: proto::ComputeEmbeddings,
     response: Response<proto::ComputeEmbeddings>,
-    session: UserSession,
+    session: Session,
     api_key: Option<Arc<str>>,
 ) -> Result<()> {
     let api_key = api_key.context("no OpenAI API key configured on the server")?;
-    authorize_access_to_language_models(&session).await?;
+    authorize_access_to_legacy_llm_endpoints(&session).await?;
+
+    let rate_limit: Box<dyn RateLimit> = match session.current_plan(&session.db().await).await? {
+        proto::Plan::ZedPro => Box::new(ZedProComputeEmbeddingsRateLimit),
+        proto::Plan::Free => Box::new(FreeComputeEmbeddingsRateLimit),
+    };
 
     session
+        .app_state
         .rate_limiter
-        .check::<ComputeEmbeddingsRateLimit>(session.user_id())
+        .check(&*rate_limit, session.user_id())
         .await?;
 
     let embeddings = match request.model.as_str() {
@@ -4949,9 +3780,9 @@ async fn compute_embeddings(
 async fn get_cached_embeddings(
     request: proto::GetCachedEmbeddings,
     response: Response<proto::GetCachedEmbeddings>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
-    authorize_access_to_language_models(&session).await?;
+    authorize_access_to_legacy_llm_endpoints(&session).await?;
 
     let db = session.db().await;
     let embeddings = db.get_embeddings(&request.model, &request.digests).await?;
@@ -4965,10 +3796,11 @@ async fn get_cached_embeddings(
     Ok(())
 }
 
-async fn authorize_access_to_language_models(session: &UserSession) -> Result<(), Error> {
-    let db = session.db().await;
-    let flags = db.get_user_flags(session.user_id()).await?;
-    if flags.iter().any(|flag| flag == "language-models") {
+/// This is leftover from before the LLM service.
+///
+/// The endpoints protected by this check will be moved there eventually.
+async fn authorize_access_to_legacy_llm_endpoints(session: &Session) -> Result<(), Error> {
+    if session.is_staff() {
         Ok(())
     } else {
         Err(anyhow!("permission denied"))?
@@ -4979,7 +3811,7 @@ async fn authorize_access_to_language_models(session: &UserSession) -> Result<()
 async fn get_supermaven_api_key(
     _request: proto::GetSupermavenApiKey,
     response: Response<proto::GetSupermavenApiKey>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let user_id: String = session.user_id().to_string();
     if !session.is_staff() {
@@ -5010,7 +3842,7 @@ async fn get_supermaven_api_key(
 async fn join_channel_chat(
     request: proto::JoinChannelChat,
     response: Response<proto::JoinChannelChat>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let channel_id = ChannelId::from_proto(request.channel_id);
 
@@ -5028,7 +3860,7 @@ async fn join_channel_chat(
 }
 
 /// Stop receiving chat updates for a channel
-async fn leave_channel_chat(request: proto::LeaveChannelChat, session: UserSession) -> Result<()> {
+async fn leave_channel_chat(request: proto::LeaveChannelChat, session: Session) -> Result<()> {
     let channel_id = ChannelId::from_proto(request.channel_id);
     session
         .db()
@@ -5042,7 +3874,7 @@ async fn leave_channel_chat(request: proto::LeaveChannelChat, session: UserSessi
 async fn get_channel_messages(
     request: proto::GetChannelMessages,
     response: Response<proto::GetChannelMessages>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let channel_id = ChannelId::from_proto(request.channel_id);
     let messages = session
@@ -5066,7 +3898,7 @@ async fn get_channel_messages(
 async fn get_channel_messages_by_id(
     request: proto::GetChannelMessagesById,
     response: Response<proto::GetChannelMessagesById>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let message_ids = request
         .message_ids
@@ -5089,7 +3921,7 @@ async fn get_channel_messages_by_id(
 async fn get_notifications(
     request: proto::GetNotifications,
     response: Response<proto::GetNotifications>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let notifications = session
         .db()
@@ -5097,9 +3929,7 @@ async fn get_notifications(
         .get_notifications(
             session.user_id(),
             NOTIFICATION_COUNT_PER_PAGE,
-            request
-                .before_id
-                .map(|id| db::NotificationId::from_proto(id)),
+            request.before_id.map(db::NotificationId::from_proto),
         )
         .await?;
     response.send(proto::GetNotificationsResponse {
@@ -5113,7 +3943,7 @@ async fn get_notifications(
 async fn mark_notification_as_read(
     request: proto::MarkNotificationRead,
     response: Response<proto::MarkNotificationRead>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let database = &session.db().await;
     let notifications = database
@@ -5135,7 +3965,7 @@ async fn mark_notification_as_read(
 async fn get_private_user_info(
     _request: proto::GetPrivateUserInfo,
     response: Response<proto::GetPrivateUserInfo>,
-    session: UserSession,
+    session: Session,
 ) -> Result<()> {
     let db = session.db().await;
 
@@ -5150,7 +3980,77 @@ async fn get_private_user_info(
         metrics_id,
         staff: user.admin,
         flags,
+        accepted_tos_at: user.accepted_tos_at.map(|t| t.and_utc().timestamp() as u64),
     })?;
+    Ok(())
+}
+
+/// Accept the terms of service (tos) on behalf of the current user
+async fn accept_terms_of_service(
+    _request: proto::AcceptTermsOfService,
+    response: Response<proto::AcceptTermsOfService>,
+    session: Session,
+) -> Result<()> {
+    let db = session.db().await;
+
+    let accepted_tos_at = Utc::now();
+    db.set_user_accepted_tos_at(session.user_id(), Some(accepted_tos_at.naive_utc()))
+        .await?;
+
+    response.send(proto::AcceptTermsOfServiceResponse {
+        accepted_tos_at: accepted_tos_at.timestamp() as u64,
+    })?;
+    Ok(())
+}
+
+/// The minimum account age an account must have in order to use the LLM service.
+const MIN_ACCOUNT_AGE_FOR_LLM_USE: chrono::Duration = chrono::Duration::days(30);
+
+async fn get_llm_api_token(
+    _request: proto::GetLlmToken,
+    response: Response<proto::GetLlmToken>,
+    session: Session,
+) -> Result<()> {
+    let db = session.db().await;
+
+    let flags = db.get_user_flags(session.user_id()).await?;
+    let has_language_models_feature_flag = flags.iter().any(|flag| flag == "language-models");
+    let has_llm_closed_beta_feature_flag = flags.iter().any(|flag| flag == "llm-closed-beta");
+
+    if !session.is_staff() && !has_language_models_feature_flag {
+        Err(anyhow!("permission denied"))?
+    }
+
+    let user_id = session.user_id();
+    let user = db
+        .get_user_by_id(user_id)
+        .await?
+        .ok_or_else(|| anyhow!("user {} not found", user_id))?;
+
+    if user.accepted_tos_at.is_none() {
+        Err(anyhow!("terms of service not accepted"))?
+    }
+
+    let mut account_created_at = user.created_at;
+    if let Some(github_created_at) = user.github_user_created_at {
+        account_created_at = account_created_at.min(github_created_at);
+    }
+    if Utc::now().naive_utc() - account_created_at < MIN_ACCOUNT_AGE_FOR_LLM_USE {
+        Err(anyhow!("account too young"))?
+    }
+
+    let billing_preferences = db.get_billing_preferences(user.id).await?;
+
+    let token = LlmTokenClaims::create(
+        &user,
+        session.is_staff(),
+        billing_preferences,
+        has_llm_closed_beta_feature_flag,
+        session.has_llm_subscription(&db).await?,
+        session.current_plan(&db).await?,
+        &session.app_state.config,
+    )?;
+    response.send(proto::GetLlmTokenResponse { token })?;
     Ok(())
 }
 
@@ -5274,7 +4174,6 @@ fn build_channels_update(channels: ChannelsForUser) -> proto::UpdateChannels {
         update.channel_invitations.push(channel.to_proto());
     }
 
-    update.hosted_projects = channels.hosted_projects;
     update
 }
 
@@ -5287,7 +4186,7 @@ fn build_initial_contacts_update(
     for contact in contacts {
         match contact {
             db::Contact::Accepted { user_id, busy } => {
-                update.contacts.push(contact_for_user(user_id, busy, &pool));
+                update.contacts.push(contact_for_user(user_id, busy, pool));
             }
             db::Contact::Outgoing { user_id } => update.outgoing_requests.push(user_id.to_proto()),
             db::Contact::Incoming { user_id } => {
@@ -5344,7 +4243,8 @@ fn channel_updated(
         None,
         pool.channel_connection_ids(channel.root_id())
             .filter_map(|(channel_id, role)| {
-                role.can_see_channel(channel.visibility).then(|| channel_id)
+                role.can_see_channel(channel.visibility)
+                    .then_some(channel_id)
             }),
         |peer_id| {
             peer.send(
@@ -5359,22 +4259,6 @@ fn channel_updated(
             )
         },
     );
-}
-
-async fn send_dev_server_projects_update(
-    user_id: UserId,
-    mut status: proto::DevServerProjectsUpdate,
-    session: &Session,
-) {
-    let pool = session.connection_pool().await;
-    for dev_server in &mut status.dev_servers {
-        dev_server.status =
-            pool.dev_server_status(DevServerId(dev_server.dev_server_id as i32)) as i32;
-    }
-    let connections = pool.user_connection_ids(user_id);
-    for connection_id in connections {
-        session.peer.send(connection_id, status.clone()).trace_err();
-    }
 }
 
 async fn update_user_contacts(user_id: UserId, session: &Session) -> Result<()> {
@@ -5412,32 +4296,7 @@ async fn update_user_contacts(user_id: UserId, session: &Session) -> Result<()> 
     Ok(())
 }
 
-async fn lost_dev_server_connection(session: &DevServerSession) -> Result<()> {
-    log::info!("lost dev server connection, unsharing projects");
-    let project_ids = session
-        .db()
-        .await
-        .get_stale_dev_server_projects(session.connection_id)
-        .await?;
-
-    for project_id in project_ids {
-        // not unshare re-checks the connection ids match, so we get away with no transaction
-        unshare_project_internal(project_id, session.connection_id, None, &session).await?;
-    }
-
-    let user_id = session.dev_server().user_id;
-    let update = session
-        .db()
-        .await
-        .dev_server_projects_update(user_id)
-        .await?;
-
-    send_dev_server_projects_update(user_id, update, session).await;
-
-    Ok(())
-}
-
-async fn leave_room_for_session(session: &UserSession, connection_id: ConnectionId) -> Result<()> {
+async fn leave_room_for_session(session: &Session, connection_id: ConnectionId) -> Result<()> {
     let mut contacts_to_update = HashSet::default();
 
     let room_id;
@@ -5494,10 +4353,10 @@ async fn leave_room_for_session(session: &UserSession, connection_id: Connection
     }
 
     for contact_user_id in contacts_to_update {
-        update_user_contacts(contact_user_id, &session).await?;
+        update_user_contacts(contact_user_id, session).await?;
     }
 
-    if let Some(live_kit) = session.live_kit_client.as_ref() {
+    if let Some(live_kit) = session.app_state.live_kit_client.as_ref() {
         live_kit
             .remove_participant(live_kit_room.clone(), session.user_id().to_string())
             .await
@@ -5533,7 +4392,7 @@ async fn leave_channel_buffers_for_session(session: &Session) -> Result<()> {
     Ok(())
 }
 
-fn project_left(project: &db::LeftProject, session: &UserSession) {
+fn project_left(project: &db::LeftProject, session: &Session) {
     for connection_id in &project.connection_ids {
         if project.should_unshare {
             session

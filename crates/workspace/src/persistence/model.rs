@@ -4,27 +4,90 @@ use crate::{
 };
 use anyhow::{Context, Result};
 use async_recursion::async_recursion;
-use client::DevServerProjectId;
 use db::sqlez::{
     bindable::{Bind, Column, StaticColumnCount},
     statement::Statement,
 };
 use gpui::{AsyncWindowContext, Model, View, WeakView};
 use project::Project;
+use remote::ssh_session::SshProjectId;
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use ui::SharedString;
 use util::ResultExt;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-pub struct SerializedDevServerProject {
-    pub id: DevServerProjectId,
-    pub dev_server_name: String,
-    pub paths: Vec<SharedString>,
+pub struct SerializedSshProject {
+    pub id: SshProjectId,
+    pub host: String,
+    pub port: Option<u16>,
+    pub paths: Vec<String>,
+    pub user: Option<String>,
+}
+
+impl SerializedSshProject {
+    pub fn ssh_urls(&self) -> Vec<PathBuf> {
+        self.paths
+            .iter()
+            .map(|path| {
+                let mut result = String::new();
+                if let Some(user) = &self.user {
+                    result.push_str(user);
+                    result.push('@');
+                }
+                result.push_str(&self.host);
+                if let Some(port) = &self.port {
+                    result.push(':');
+                    result.push_str(&port.to_string());
+                }
+                result.push_str(path);
+                PathBuf::from(result)
+            })
+            .collect()
+    }
+}
+
+impl StaticColumnCount for SerializedSshProject {
+    fn column_count() -> usize {
+        5
+    }
+}
+
+impl Bind for &SerializedSshProject {
+    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
+        let next_index = statement.bind(&self.id.0, start_index)?;
+        let next_index = statement.bind(&self.host, next_index)?;
+        let next_index = statement.bind(&self.port, next_index)?;
+        let raw_paths = serde_json::to_string(&self.paths)?;
+        let next_index = statement.bind(&raw_paths, next_index)?;
+        statement.bind(&self.user, next_index)
+    }
+}
+
+impl Column for SerializedSshProject {
+    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
+        let id = statement.column_int64(start_index)?;
+        let host = statement.column_text(start_index + 1)?.to_string();
+        let (port, _) = Option::<u16>::column(statement, start_index + 2)?;
+        let raw_paths = statement.column_text(start_index + 3)?.to_string();
+        let paths: Vec<String> = serde_json::from_str(&raw_paths)?;
+
+        let (user, _) = Option::<String>::column(statement, start_index + 4)?;
+
+        Ok((
+            Self {
+                id: SshProjectId(id as u64),
+                host,
+                port,
+                paths,
+                user,
+            },
+            start_index + 5,
+        ))
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -58,7 +121,6 @@ impl Column for LocalPaths {
     fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
         let path_blob = statement.column_blob(start_index)?;
         let paths: Arc<Vec<PathBuf>> = if path_blob.is_empty() {
-            println!("path blog is empty");
             Default::default()
         } else {
             bincode::deserialize(path_blob).context("Bincode deserialization of paths failed")?
@@ -105,48 +167,10 @@ impl Column for LocalPathsOrder {
     }
 }
 
-impl From<SerializedDevServerProject> for SerializedWorkspaceLocation {
-    fn from(dev_server_project: SerializedDevServerProject) -> Self {
-        Self::DevServer(dev_server_project)
-    }
-}
-
-impl StaticColumnCount for SerializedDevServerProject {}
-impl Bind for &SerializedDevServerProject {
-    fn bind(&self, statement: &Statement, start_index: i32) -> Result<i32> {
-        let next_index = statement.bind(&self.id.0, start_index)?;
-        let next_index = statement.bind(&self.dev_server_name, next_index)?;
-        let paths = serde_json::to_string(&self.paths)?;
-        statement.bind(&paths, next_index)
-    }
-}
-
-impl Column for SerializedDevServerProject {
-    fn column(statement: &mut Statement, start_index: i32) -> Result<(Self, i32)> {
-        let id = statement.column_int64(start_index)?;
-        let dev_server_name = statement.column_text(start_index + 1)?.to_string();
-        let paths = statement.column_text(start_index + 2)?.to_string();
-        let paths: Vec<SharedString> = if paths.starts_with('[') {
-            serde_json::from_str(&paths).context("JSON deserialization of paths failed")?
-        } else {
-            vec![paths.into()]
-        };
-
-        Ok((
-            Self {
-                id: DevServerProjectId(id as u64),
-                dev_server_name,
-                paths,
-            },
-            start_index + 3,
-        ))
-    }
-}
-
 #[derive(Debug, PartialEq, Clone)]
 pub enum SerializedWorkspaceLocation {
     Local(LocalPaths, LocalPathsOrder),
-    DevServer(SerializedDevServerProject),
+    Ssh(SerializedSshProject),
 }
 
 impl SerializedWorkspaceLocation {
@@ -216,6 +240,7 @@ pub(crate) struct SerializedWorkspace {
     pub(crate) display: Option<Uuid>,
     pub(crate) docks: DockStructure,
     pub(crate) session_id: Option<String>,
+    pub(crate) window_id: Option<u64>,
 }
 
 #[derive(Debug, PartialEq, Clone, Default)]
@@ -296,6 +321,7 @@ impl Default for SerializedPaneGroup {
         Self::Pane(SerializedPane {
             children: vec![SerializedItem::default()],
             active: false,
+            pinned_count: 0,
         })
     }
 }
@@ -355,11 +381,17 @@ impl SerializedPaneGroup {
 
                 if pane.update(cx, |pane, _| pane.items_len() != 0).log_err()? {
                     let pane = pane.upgrade()?;
-                    Some((Member::Pane(pane.clone()), active.then(|| pane), new_items))
+                    Some((
+                        Member::Pane(pane.clone()),
+                        active.then_some(pane),
+                        new_items,
+                    ))
                 } else {
                     let pane = pane.upgrade()?;
                     workspace
-                        .update(cx, |workspace, cx| workspace.force_remove_pane(&pane, cx))
+                        .update(cx, |workspace, cx| {
+                            workspace.force_remove_pane(&pane, &None, cx)
+                        })
                         .log_err()?;
                     None
                 }
@@ -372,11 +404,16 @@ impl SerializedPaneGroup {
 pub struct SerializedPane {
     pub(crate) active: bool,
     pub(crate) children: Vec<SerializedItem>,
+    pub(crate) pinned_count: usize,
 }
 
 impl SerializedPane {
-    pub fn new(children: Vec<SerializedItem>, active: bool) -> Self {
-        SerializedPane { children, active }
+    pub fn new(children: Vec<SerializedItem>, active: bool, pinned_count: usize) -> Self {
+        SerializedPane {
+            children,
+            active,
+            pinned_count,
+        }
     }
 
     pub async fn deserialize_to(
@@ -435,6 +472,9 @@ impl SerializedPane {
                 }
             })?;
         }
+        pane.update(cx, |pane, _| {
+            pane.set_pinned_count(self.pinned_count);
+        })?;
 
         anyhow::Ok(items)
     }

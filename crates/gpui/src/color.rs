@@ -1,7 +1,7 @@
 use anyhow::{bail, Context};
 use serde::de::{self, Deserialize, Deserializer, Visitor};
 use std::{
-    fmt,
+    fmt::{self, Display, Formatter},
     hash::{Hash, Hasher},
 };
 
@@ -279,6 +279,19 @@ impl Hash for Hsla {
     }
 }
 
+impl Display for Hsla {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hsla({:.2}, {:.2}%, {:.2}%, {:.2})",
+            self.h * 360.,
+            self.s * 100.,
+            self.l * 100.,
+            self.a
+        )
+    }
+}
+
 /// Construct an [`Hsla`] object from plain values
 pub fn hsla(h: f32, s: f32, l: f32, a: f32) -> Hsla {
     Hsla {
@@ -460,6 +473,16 @@ impl Hsla {
     /// Where 0.0 will leave the color unchanged, and 1.0 will completely fade out the color.
     pub fn fade_out(&mut self, factor: f32) {
         self.a *= 1.0 - factor.clamp(0., 1.);
+    }
+
+    /// Returns a new HSLA color with the same hue, saturation, and lightness, but with a modified alpha value.
+    pub fn opacity(&self, factor: f32) -> Self {
+        Hsla {
+            h: self.h,
+            s: self.s,
+            l: self.l,
+            a: self.a * factor.clamp(0., 1.),
+        }
     }
 }
 

@@ -30,7 +30,7 @@ impl Render for DiagnosticIndicator {
             (0, warning_count) => h_flex()
                 .gap_1()
                 .child(
-                    Icon::new(IconName::ExclamationTriangle)
+                    Icon::new(IconName::Warning)
                         .size(IconSize::Small)
                         .color(Color::Warning),
                 )
@@ -52,7 +52,7 @@ impl Render for DiagnosticIndicator {
                 )
                 .child(Label::new(error_count.to_string()).size(LabelSize::Small))
                 .child(
-                    Icon::new(IconName::ExclamationTriangle)
+                    Icon::new(IconName::Warning)
                         .size(IconSize::Small)
                         .color(Color::Warning),
                 )
@@ -136,11 +136,12 @@ impl DiagnosticIndicator {
     }
 
     fn update(&mut self, editor: View<Editor>, cx: &mut ViewContext<Self>) {
-        let editor = editor.read(cx);
-        let buffer = editor.buffer().read(cx);
-        let cursor_position = editor.selections.newest::<usize>(cx).head();
+        let (buffer, cursor_position) = editor.update(cx, |editor, cx| {
+            let buffer = editor.buffer().read(cx).snapshot(cx);
+            let cursor_position = editor.selections.newest::<usize>(cx).head();
+            (buffer, cursor_position)
+        });
         let new_diagnostic = buffer
-            .snapshot(cx)
             .diagnostics_in_range::<_, usize>(cursor_position..cursor_position, false)
             .filter(|entry| !entry.range.is_empty())
             .min_by_key(|entry| (entry.diagnostic.severity, entry.range.len()))

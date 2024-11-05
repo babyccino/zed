@@ -1,12 +1,11 @@
-use crate::{grouped_diagnostics::GroupedDiagnosticsEditor, ProjectDiagnosticsEditor};
-use futures::future::Either;
+use crate::ProjectDiagnosticsEditor;
 use gpui::{EventEmitter, ParentElement, Render, View, ViewContext, WeakView};
 use ui::prelude::*;
-use ui::{IconButton, IconName, Tooltip};
+use ui::{IconButton, IconButtonShape, IconName, Tooltip};
 use workspace::{item::ItemHandle, ToolbarItemEvent, ToolbarItemLocation, ToolbarItemView};
 
 pub struct ToolbarControls {
-    editor: Option<Either<WeakView<ProjectDiagnosticsEditor>, WeakView<GroupedDiagnosticsEditor>>>,
+    editor: Option<WeakView<ProjectDiagnosticsEditor>>,
 }
 
 impl Render for ToolbarControls {
@@ -15,33 +14,17 @@ impl Render for ToolbarControls {
         let mut has_stale_excerpts = false;
         let mut is_updating = false;
 
-        if let Some(editor) = self.editor() {
-            match editor {
-                Either::Left(editor) => {
-                    let editor = editor.read(cx);
-                    include_warnings = editor.include_warnings;
-                    has_stale_excerpts = !editor.paths_to_update.is_empty();
-                    is_updating = editor.update_paths_tx.len() > 0
-                        || editor
-                            .project
-                            .read(cx)
-                            .language_servers_running_disk_based_diagnostics()
-                            .next()
-                            .is_some();
-                }
-                Either::Right(editor) => {
-                    let editor = editor.read(cx);
-                    include_warnings = editor.include_warnings;
-                    has_stale_excerpts = !editor.paths_to_update.is_empty();
-                    is_updating = editor.update_paths_tx.len() > 0
-                        || editor
-                            .project
-                            .read(cx)
-                            .language_servers_running_disk_based_diagnostics()
-                            .next()
-                            .is_some();
-                }
-            }
+        if let Some(editor) = self.diagnostics() {
+            let diagnostics = editor.read(cx);
+            include_warnings = diagnostics.include_warnings;
+            has_stale_excerpts = !diagnostics.paths_to_update.is_empty();
+            is_updating = diagnostics.update_excerpts_task.is_some()
+                || diagnostics
+                    .project
+                    .read(cx)
+                    .language_servers_running_disk_based_diagnostics(cx)
+                    .next()
+                    .is_some();
         }
 
         let tooltip = if include_warnings {
@@ -50,48 +33,40 @@ impl Render for ToolbarControls {
             "Include Warnings"
         };
 
+        let warning_color = if include_warnings {
+            Color::Warning
+        } else {
+            Color::Muted
+        };
+
         h_flex()
+            .gap_1()
             .when(has_stale_excerpts, |div| {
                 div.child(
                     IconButton::new("update-excerpts", IconName::Update)
                         .icon_color(Color::Info)
+                        .shape(IconButtonShape::Square)
                         .disabled(is_updating)
                         .tooltip(move |cx| Tooltip::text("Update excerpts", cx))
                         .on_click(cx.listener(|this, _, cx| {
-                            if let Some(editor) = this.editor() {
-                                match editor {
-                                    Either::Left(editor) => {
-                                        editor.update(cx, |editor, _| {
-                                            editor.enqueue_update_stale_excerpts(None);
-                                        });
-                                    }
-                                    Either::Right(editor) => {
-                                        editor.update(cx, |editor, _| {
-                                            editor.enqueue_update_stale_excerpts(None);
-                                        });
-                                    }
-                                }
+                            if let Some(diagnostics) = this.diagnostics() {
+                                diagnostics.update(cx, |diagnostics, cx| {
+                                    diagnostics.update_all_excerpts(cx);
+                                });
                             }
                         })),
                 )
             })
             .child(
-                IconButton::new("toggle-warnings", IconName::ExclamationTriangle)
+                IconButton::new("toggle-warnings", IconName::Warning)
+                    .icon_color(warning_color)
+                    .shape(IconButtonShape::Square)
                     .tooltip(move |cx| Tooltip::text(tooltip, cx))
                     .on_click(cx.listener(|this, _, cx| {
-                        if let Some(editor) = this.editor() {
-                            match editor {
-                                Either::Left(editor) => {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.toggle_warnings(&Default::default(), cx);
-                                    });
-                                }
-                                Either::Right(editor) => {
-                                    editor.update(cx, |editor, cx| {
-                                        editor.toggle_warnings(&Default::default(), cx);
-                                    });
-                                }
-                            }
+                        if let Some(editor) = this.diagnostics() {
+                            editor.update(cx, |editor, cx| {
+                                editor.toggle_warnings(&Default::default(), cx);
+                            });
                         }
                     })),
             )
@@ -108,10 +83,7 @@ impl ToolbarItemView for ToolbarControls {
     ) -> ToolbarItemLocation {
         if let Some(pane_item) = active_pane_item.as_ref() {
             if let Some(editor) = pane_item.downcast::<ProjectDiagnosticsEditor>() {
-                self.editor = Some(Either::Left(editor.downgrade()));
-                ToolbarItemLocation::PrimaryRight
-            } else if let Some(editor) = pane_item.downcast::<GroupedDiagnosticsEditor>() {
-                self.editor = Some(Either::Right(editor.downgrade()));
+                self.editor = Some(editor.downgrade());
                 ToolbarItemLocation::PrimaryRight
             } else {
                 ToolbarItemLocation::Hidden
@@ -122,17 +94,18 @@ impl ToolbarItemView for ToolbarControls {
     }
 }
 
+impl Default for ToolbarControls {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolbarControls {
     pub fn new() -> Self {
         ToolbarControls { editor: None }
     }
 
-    fn editor(
-        &self,
-    ) -> Option<Either<View<ProjectDiagnosticsEditor>, View<GroupedDiagnosticsEditor>>> {
-        Some(match self.editor.as_ref()? {
-            Either::Left(diagnostics) => Either::Left(diagnostics.upgrade()?),
-            Either::Right(grouped_diagnostics) => Either::Right(grouped_diagnostics.upgrade()?),
-        })
+    fn diagnostics(&self) -> Option<View<ProjectDiagnosticsEditor>> {
+        self.editor.as_ref()?.upgrade()
     }
 }

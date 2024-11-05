@@ -5,7 +5,7 @@ use self::channel_modal::ChannelModal;
 use crate::{channel_view::ChannelView, chat_panel::ChatPanel, CollaborationPanelSettings};
 use call::ActiveCall;
 use channel::{Channel, ChannelEvent, ChannelStore};
-use client::{ChannelId, Client, Contact, ProjectId, User, UserStore};
+use client::{ChannelId, Client, Contact, User, UserStore};
 use contact_finder::ContactFinder;
 use db::kvp::KEY_VALUE_STORE;
 use editor::{Editor, EditorElement, EditorStyle};
@@ -182,10 +182,6 @@ enum ListEntry {
     ChannelEditor {
         depth: usize,
     },
-    HostedProject {
-        id: ProjectId,
-        name: SharedString,
-    },
     Contact {
         contact: Arc<Contact>,
         calling: bool,
@@ -219,7 +215,7 @@ impl CollabPanel {
             })
             .detach();
 
-            let channel_name_editor = cx.new_view(|cx| Editor::single_line(cx));
+            let channel_name_editor = cx.new_view(Editor::single_line);
 
             cx.subscribe(&channel_name_editor, |this: &mut Self, _, event, cx| {
                 if let editor::EditorEvent::Blurred = event {
@@ -328,7 +324,7 @@ impl CollabPanel {
                     panel.width = serialized_panel.width.map(|w| w.round());
                     panel.collapsed_channels = serialized_panel
                         .collapsed_channels
-                        .unwrap_or_else(|| Vec::new())
+                        .unwrap_or_else(Vec::new)
                         .iter()
                         .map(|cid| ChannelId(*cid))
                         .collect();
@@ -566,7 +562,6 @@ impl CollabPanel {
                     }
                 }
 
-                let hosted_projects = channel_store.projects_for_id(channel.id);
                 let has_children = channel_store
                     .channel_at_index(mat.candidate_id + 1)
                     .map_or(false, |next_channel| {
@@ -599,10 +594,6 @@ impl CollabPanel {
                             has_children,
                         });
                     }
-                }
-
-                for (name, id) in hosted_projects {
-                    self.entries.push(ListEntry::HostedProject { id, name });
                 }
             }
         }
@@ -955,7 +946,7 @@ impl CollabPanel {
     }
 
     fn take_editing_state(&mut self, cx: &mut ViewContext<Self>) -> bool {
-        if let Some(_) = self.channel_editing_state.take() {
+        if self.channel_editing_state.take().is_some() {
             self.channel_name_editor.update(cx, |editor, cx| {
                 editor.set_text("", cx);
             });
@@ -1027,40 +1018,6 @@ impl CollabPanel {
             )
             .child(Label::new("chat"))
             .tooltip(move |cx| Tooltip::text("Open Chat", cx))
-    }
-
-    fn render_channel_project(
-        &self,
-        id: ProjectId,
-        name: &SharedString,
-        is_selected: bool,
-        cx: &mut ViewContext<Self>,
-    ) -> impl IntoElement {
-        ListItem::new(ElementId::NamedInteger(
-            "channel-project".into(),
-            id.0 as usize,
-        ))
-        .indent_level(2)
-        .indent_step_size(px(20.))
-        .selected(is_selected)
-        .on_click(cx.listener(move |this, _, cx| {
-            if let Some(workspace) = this.workspace.upgrade() {
-                let app_state = workspace.read(cx).app_state().clone();
-                workspace::join_hosted_project(id, app_state, cx).detach_and_prompt_err(
-                    "Failed to open project",
-                    cx,
-                    |_, _| None,
-                )
-            }
-        }))
-        .start_slot(
-            h_flex()
-                .relative()
-                .gap_1()
-                .child(IconButton::new(0, IconName::FileTree)),
-        )
-        .child(Label::new(name.clone()))
-        .tooltip(move |cx| Tooltip::text("Open Project", cx))
     }
 
     fn has_subchannels(&self, ix: usize) -> bool {
@@ -1395,15 +1352,22 @@ impl CollabPanel {
         cx.notify();
     }
 
+    fn reset_filter_editor_text(&mut self, cx: &mut ViewContext<Self>) -> bool {
+        self.filter_editor.update(cx, |editor, cx| {
+            if editor.buffer().read(cx).len(cx) > 0 {
+                editor.set_text("", cx);
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     fn cancel(&mut self, _: &Cancel, cx: &mut ViewContext<Self>) {
         if self.take_editing_state(cx) {
             cx.focus_view(&self.filter_editor);
-        } else {
-            self.filter_editor.update(cx, |editor, cx| {
-                if editor.buffer().read(cx).len(cx) > 0 {
-                    editor.set_text("", cx);
-                }
-            });
+        } else if !self.reset_filter_editor_text(cx) {
+            self.focus_handle.focus(cx);
         }
 
         if self.context_menu.is_some() {
@@ -1530,12 +1494,6 @@ impl CollabPanel {
                     }
                     ListEntry::ChannelChat { channel_id } => {
                         self.join_channel_chat(*channel_id, cx)
-                    }
-                    ListEntry::HostedProject {
-                        id: _id,
-                        name: _name,
-                    } => {
-                        // todo()
                     }
                     ListEntry::OutgoingRequest(_) => {}
                     ListEntry::ChannelEditor { .. } => {}
@@ -1843,8 +1801,7 @@ impl CollabPanel {
         if let Some(contact) = self.selected_contact() {
             self.deploy_contact_context_menu(bounds.center(), contact, cx);
             cx.stop_propagation();
-            return;
-        };
+        }
     }
 
     fn selected_channel(&self) -> Option<&Arc<Channel>> {
@@ -2042,7 +1999,7 @@ impl CollabPanel {
         let Some(channel) = channel_store.channel_for_id(channel_id) else {
             return;
         };
-        let item = ClipboardItem::new(channel.link(cx));
+        let item = ClipboardItem::new_string(channel.link(cx));
         cx.write_to_clipboard(item)
     }
 
@@ -2135,7 +2092,7 @@ impl CollabPanel {
             } => self
                 .render_participant_project(
                     *project_id,
-                    &worktree_root_names,
+                    worktree_root_names,
                     *host_user_id,
                     *is_last,
                     is_selected,
@@ -2150,10 +2107,6 @@ impl CollabPanel {
                 .into_any_element(),
             ListEntry::ChannelChat { channel_id } => self
                 .render_channel_chat(*channel_id, is_selected, cx)
-                .into_any_element(),
-
-            ListEntry::HostedProject { id, name } => self
-                .render_channel_project(*id, name, is_selected, cx)
                 .into_any_element(),
         }
     }
@@ -2190,6 +2143,7 @@ impl CollabPanel {
             },
             font_family: settings.ui_font.family.clone(),
             font_features: settings.ui_font.features.clone(),
+            font_fallbacks: settings.ui_font.fallbacks.clone(),
             font_size: rems(0.875).into(),
             font_weight: settings.ui_font.weight,
             font_style: FontStyle::Normal,
@@ -2260,7 +2214,7 @@ impl CollabPanel {
                     .size(ButtonSize::None)
                     .visible_on_hover("section-header")
                     .on_click(move |_, cx| {
-                        let item = ClipboardItem::new(channel_link_copy.clone());
+                        let item = ClipboardItem::new_string(channel_link_copy.clone());
                         cx.write_to_clipboard(item)
                     })
                     .tooltip(|cx| Tooltip::text("Copy channel link", cx))
@@ -2393,7 +2347,7 @@ impl CollabPanel {
     ) -> impl IntoElement {
         let github_login = SharedString::from(user.github_login.clone());
         let user_id = user.id;
-        let is_response_pending = self.user_store.read(cx).is_contact_request_pending(&user);
+        let is_response_pending = self.user_store.read(cx).is_contact_request_pending(user);
         let color = if is_response_pending {
             Color::Muted
         } else {
@@ -2449,7 +2403,7 @@ impl CollabPanel {
         let response_is_pending = self
             .channel_store
             .read(cx)
-            .has_pending_channel_invite_response(&channel);
+            .has_pending_channel_invite_response(channel);
         let color = if response_is_pending {
             Color::Muted
         } else {
@@ -2772,7 +2726,7 @@ impl Render for CollabPanel {
             .on_action(cx.listener(CollabPanel::collapse_selected_channel))
             .on_action(cx.listener(CollabPanel::expand_selected_channel))
             .on_action(cx.listener(CollabPanel::start_move_selected_channel))
-            .track_focus(&self.focus_handle)
+            .track_focus(&self.focus_handle(cx))
             .size_full()
             .child(if self.user_store.read(cx).current_user().is_none() {
                 self.render_signed_out(cx)
@@ -2824,7 +2778,7 @@ impl Panel for CollabPanel {
     fn icon(&self, cx: &gpui::WindowContext) -> Option<ui::IconName> {
         CollaborationPanelSettings::get_global(cx)
             .button
-            .then(|| ui::IconName::Collab)
+            .then_some(ui::IconName::UserGroup)
     }
 
     fn icon_tooltip(&self, _cx: &WindowContext) -> Option<&'static str> {
@@ -2889,11 +2843,6 @@ impl PartialEq for ListEntry {
                 } = other
                 {
                     return channel_1.id == channel_2.id;
-                }
-            }
-            ListEntry::HostedProject { id, .. } => {
-                if let ListEntry::HostedProject { id: other_id, .. } = other {
-                    return id == other_id;
                 }
             }
             ListEntry::ChannelNotes { channel_id } => {

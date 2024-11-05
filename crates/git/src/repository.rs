@@ -1,8 +1,9 @@
 use crate::GitHostingProviderRegistry;
 use crate::{blame::Blame, status::GitStatus};
 use anyhow::{Context, Result};
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use git2::BranchType;
+use gpui::SharedString;
 use parking_lot::Mutex;
 use rope::Rope;
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use util::ResultExt;
 #[derive(Clone, Debug, Hash, PartialEq)]
 pub struct Branch {
     pub is_head: bool,
-    pub name: Box<str>,
+    pub name: SharedString,
     /// Timestamp of most recent commit, normalized to Unix Epoch format.
     pub unix_timestamp: Option<i64>,
 }
@@ -36,15 +37,12 @@ pub trait GitRepository: Send + Sync {
     /// Returns the SHA of the current HEAD.
     fn head_sha(&self) -> Option<String>;
 
-    fn statuses(&self, path_prefix: &Path) -> Result<GitStatus>;
-
-    fn status(&self, path: &Path) -> Option<GitFileStatus> {
-        Some(self.statuses(path).ok()?.entries.first()?.1)
-    }
+    fn status(&self, path_prefixes: &[PathBuf]) -> Result<GitStatus>;
 
     fn branches(&self) -> Result<Vec<Branch>>;
     fn change_branch(&self, _: &str) -> Result<()>;
     fn create_branch(&self, _: &str) -> Result<()>;
+    fn branch_exits(&self, _: &str) -> Result<bool>;
 
     fn blame(&self, path: &Path, content: Rope) -> Result<crate::blame::Blame>;
 }
@@ -126,14 +124,26 @@ impl GitRepository for RealGitRepository {
         Some(self.repository.lock().head().ok()?.target()?.to_string())
     }
 
-    fn statuses(&self, path_prefix: &Path) -> Result<GitStatus> {
+    fn status(&self, path_prefixes: &[PathBuf]) -> Result<GitStatus> {
         let working_directory = self
             .repository
             .lock()
             .workdir()
             .context("failed to read git work directory")?
             .to_path_buf();
-        GitStatus::new(&self.git_binary_path, &working_directory, path_prefix)
+        GitStatus::new(&self.git_binary_path, &working_directory, path_prefixes)
+    }
+
+    fn branch_exits(&self, name: &str) -> Result<bool> {
+        let repo = self.repository.lock();
+        let branch = repo.find_branch(name, BranchType::Local);
+        match branch {
+            Ok(_) => Ok(true),
+            Err(e) => match e.code() {
+                git2::ErrorCode::NotFound => Ok(false),
+                _ => Err(anyhow::anyhow!(e)),
+            },
+        }
     }
 
     fn branches(&self) -> Result<Vec<Branch>> {
@@ -143,7 +153,11 @@ impl GitRepository for RealGitRepository {
             .filter_map(|branch| {
                 branch.ok().and_then(|(branch, _)| {
                     let is_head = branch.is_head();
-                    let name = branch.name().ok().flatten().map(Box::from)?;
+                    let name = branch
+                        .name()
+                        .ok()
+                        .flatten()
+                        .map(|name| name.to_string().into())?;
                     let timestamp = branch.get().peel_to_commit().ok()?.time();
                     let unix_timestamp = timestamp.seconds();
                     let timezone_offset = timestamp.offset_minutes();
@@ -205,22 +219,39 @@ impl GitRepository for RealGitRepository {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FakeGitRepository {
     state: Arc<Mutex<FakeGitRepositoryState>>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct FakeGitRepositoryState {
+    pub path: PathBuf,
+    pub event_emitter: smol::channel::Sender<PathBuf>,
     pub index_contents: HashMap<PathBuf, String>,
     pub blames: HashMap<PathBuf, Blame>,
     pub worktree_statuses: HashMap<RepoPath, GitFileStatus>,
-    pub branch_name: Option<String>,
+    pub current_branch_name: Option<String>,
+    pub branches: HashSet<String>,
 }
 
 impl FakeGitRepository {
     pub fn open(state: Arc<Mutex<FakeGitRepositoryState>>) -> Arc<dyn GitRepository> {
         Arc::new(FakeGitRepository { state })
+    }
+}
+
+impl FakeGitRepositoryState {
+    pub fn new(path: PathBuf, event_emitter: smol::channel::Sender<PathBuf>) -> Self {
+        FakeGitRepositoryState {
+            path,
+            event_emitter,
+            index_contents: Default::default(),
+            blames: Default::default(),
+            worktree_statuses: Default::default(),
+            current_branch_name: Default::default(),
+            branches: Default::default(),
+        }
     }
 }
 
@@ -238,20 +269,23 @@ impl GitRepository for FakeGitRepository {
 
     fn branch_name(&self) -> Option<String> {
         let state = self.state.lock();
-        state.branch_name.clone()
+        state.current_branch_name.clone()
     }
 
     fn head_sha(&self) -> Option<String> {
         None
     }
 
-    fn statuses(&self, path_prefix: &Path) -> Result<GitStatus> {
+    fn status(&self, path_prefixes: &[PathBuf]) -> Result<GitStatus> {
         let state = self.state.lock();
         let mut entries = state
             .worktree_statuses
             .iter()
             .filter_map(|(repo_path, status)| {
-                if repo_path.0.starts_with(path_prefix) {
+                if path_prefixes
+                    .iter()
+                    .any(|path_prefix| repo_path.0.starts_with(path_prefix))
+                {
                     Some((repo_path.to_owned(), *status))
                 } else {
                     None
@@ -265,18 +299,41 @@ impl GitRepository for FakeGitRepository {
     }
 
     fn branches(&self) -> Result<Vec<Branch>> {
-        Ok(vec![])
+        let state = self.state.lock();
+        let current_branch = &state.current_branch_name;
+        Ok(state
+            .branches
+            .iter()
+            .map(|branch_name| Branch {
+                is_head: Some(branch_name) == current_branch.as_ref(),
+                name: branch_name.into(),
+                unix_timestamp: None,
+            })
+            .collect())
+    }
+
+    fn branch_exits(&self, name: &str) -> Result<bool> {
+        let state = self.state.lock();
+        Ok(state.branches.contains(name))
     }
 
     fn change_branch(&self, name: &str) -> Result<()> {
         let mut state = self.state.lock();
-        state.branch_name = Some(name.to_owned());
+        state.current_branch_name = Some(name.to_owned());
+        state
+            .event_emitter
+            .try_send(state.path.clone())
+            .expect("Dropped repo change event");
         Ok(())
     }
 
     fn create_branch(&self, name: &str) -> Result<()> {
         let mut state = self.state.lock();
-        state.branch_name = Some(name.to_owned());
+        state.branches.insert(name.to_owned());
+        state
+            .event_emitter
+            .try_send(state.path.clone())
+            .expect("Dropped repo change event");
         Ok(())
     }
 

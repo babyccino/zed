@@ -26,6 +26,9 @@ actions!(
     zed,
     [
         OpenSettings,
+        OpenDefaultKeymap,
+        OpenAccountSettings,
+        OpenServerSettings,
         Quit,
         OpenKeymap,
         About,
@@ -39,3 +42,10 @@ actions!(
         ResetUiFontSize
     ]
 );
+
+#[derive(Clone, Default, Deserialize, PartialEq)]
+pub struct InlineAssist {
+    pub prompt: Option<String>,
+}
+
+impl_actions!(assistant, [InlineAssist]);

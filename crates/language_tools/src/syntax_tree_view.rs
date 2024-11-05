@@ -128,12 +128,14 @@ impl SyntaxTreeView {
     fn editor_updated(&mut self, did_reparse: bool, cx: &mut ViewContext<Self>) -> Option<()> {
         // Find which excerpt the cursor is in, and the position within that excerpted buffer.
         let editor_state = self.editor.as_mut()?;
-        let editor = &editor_state.editor.read(cx);
-        let selection_range = editor.selections.last::<usize>(cx).range();
-        let multibuffer = editor.buffer().read(cx);
-        let (buffer, range, excerpt_id) = multibuffer
-            .range_to_buffer_ranges(selection_range, cx)
-            .pop()?;
+        let (buffer, range, excerpt_id) = editor_state.editor.update(cx, |editor, cx| {
+            let selection_range = editor.selections.last::<usize>(cx).range();
+            editor
+                .buffer()
+                .read(cx)
+                .range_to_buffer_ranges(selection_range, cx)
+                .pop()
+        })?;
 
         // If the cursor has moved into a different excerpt, retrieve a new syntax layer
         // from that buffer.
@@ -249,24 +251,23 @@ impl SyntaxTreeView {
         }
 
         let node = cursor.node();
-        return row
-            .child(if node.is_named() {
-                Label::new(node.kind()).color(Color::Default)
-            } else {
-                Label::new(format!("\"{}\"", node.kind())).color(Color::Created)
-            })
-            .child(
-                div()
-                    .child(Label::new(format_node_range(node)).color(Color::Muted))
-                    .pl_1(),
-            )
-            .text_bg(if selected {
-                colors.element_selected
-            } else {
-                Hsla::default()
-            })
-            .pl(rems(depth as f32))
-            .hover(|style| style.bg(colors.element_hover));
+        row.child(if node.is_named() {
+            Label::new(node.kind()).color(Color::Default)
+        } else {
+            Label::new(format!("\"{}\"", node.kind())).color(Color::Created)
+        })
+        .child(
+            div()
+                .child(Label::new(format_node_range(node)).color(Color::Muted))
+                .pl_1(),
+        )
+        .text_bg(if selected {
+            colors.element_selected
+        } else {
+            Hsla::default()
+        })
+        .pl(rems(depth as f32))
+        .hover(|style| style.bg(colors.element_hover))
     }
 }
 
@@ -406,6 +407,12 @@ impl Item for SyntaxTreeView {
     }
 }
 
+impl Default for SyntaxTreeToolbarItemView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SyntaxTreeToolbarItemView {
     pub fn new() -> Self {
         Self {
@@ -466,7 +473,7 @@ impl SyntaxTreeToolbarItemView {
 
     fn render_header(active_layer: &OwnedSyntaxLayer) -> ButtonLike {
         ButtonLike::new("syntax tree header")
-            .child(Label::new(active_layer.language.name()))
+            .child(Label::new(active_layer.language.name().0))
             .child(Label::new(format_node_range(active_layer.node())))
     }
 }

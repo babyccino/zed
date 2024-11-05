@@ -1,5 +1,6 @@
 use crate::{Client, Connection, Credentials, EstablishConnectionError, UserStore};
 use anyhow::{anyhow, Result};
+use chrono::Duration;
 use futures::{stream::BoxStream, StreamExt};
 use gpui::{BackgroundExecutor, Context, Model, TestAppContext};
 use parking_lot::Mutex;
@@ -48,7 +49,7 @@ impl FakeServer {
                         let mut state = state.lock();
                         state.auth_count += 1;
                         let access_token = state.access_token.to_string();
-                        Ok(Credentials::User {
+                        Ok(Credentials {
                             user_id: client_user_id,
                             access_token,
                         })
@@ -72,7 +73,7 @@ impl FakeServer {
                         }
 
                         if credentials
-                            != (Credentials::User {
+                            != (Credentials {
                                 user_id: client_user_id,
                                 access_token: state.lock().access_token.to_string(),
                             })
@@ -162,6 +163,11 @@ impl FakeServer {
                 return Ok(*message.downcast().unwrap());
             }
 
+            let accepted_tos_at = chrono::Utc::now()
+                .checked_sub_signed(Duration::hours(5))
+                .expect("failed to build accepted_tos_at")
+                .timestamp() as u64;
+
             if message.is::<TypedEnvelope<GetPrivateUserInfo>>() {
                 self.respond(
                     message
@@ -172,6 +178,7 @@ impl FakeServer {
                         metrics_id: "the-metrics-id".into(),
                         staff: false,
                         flags: Default::default(),
+                        accepted_tos_at: Some(accepted_tos_at),
                     },
                 );
                 continue;

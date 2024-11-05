@@ -1,9 +1,11 @@
-use super::{SlashCommand, SlashCommandOutput};
 use crate::prompt_library::PromptStore;
 use anyhow::{anyhow, Result};
-use assistant_slash_command::{ArgumentCompletion, SlashCommandOutputSection};
-use gpui::{AppContext, Task, WeakView};
-use language::LspAdapterDelegate;
+use assistant_slash_command::{
+    ArgumentCompletion, SlashCommand, SlashCommandOutput, SlashCommandOutputSection,
+    SlashCommandResult,
+};
+use gpui::{Task, WeakView};
+use language::{BufferSnapshot, LspAdapterDelegate};
 use std::{
     fmt::Write,
     sync::{atomic::AtomicBool, Arc},
@@ -32,21 +34,23 @@ impl SlashCommand for DefaultSlashCommand {
 
     fn complete_argument(
         self: Arc<Self>,
-        _query: String,
+        _arguments: &[String],
         _cancellation_flag: Arc<AtomicBool>,
         _workspace: Option<WeakView<Workspace>>,
-        _cx: &mut AppContext,
+        _cx: &mut WindowContext,
     ) -> Task<Result<Vec<ArgumentCompletion>>> {
         Task::ready(Err(anyhow!("this command does not require argument")))
     }
 
     fn run(
         self: Arc<Self>,
-        _argument: Option<&str>,
+        _arguments: &[String],
+        _context_slash_command_output_sections: &[SlashCommandOutputSection<language::Anchor>],
+        _context_buffer: BufferSnapshot,
         _workspace: WeakView<Workspace>,
-        _delegate: Arc<dyn LspAdapterDelegate>,
+        _delegate: Option<Arc<dyn LspAdapterDelegate>>,
         cx: &mut WindowContext,
-    ) -> Task<Result<SlashCommandOutput>> {
+    ) -> Task<SlashCommandResult> {
         let store = PromptStore::global(cx);
         cx.background_executor().spawn(async move {
             let store = store.await?;
@@ -70,10 +74,12 @@ impl SlashCommand for DefaultSlashCommand {
                     range: 0..text.len(),
                     icon: IconName::Library,
                     label: "Default".into(),
+                    metadata: None,
                 }],
                 text,
                 run_commands_in_text: true,
-            })
+            }
+            .to_event_stream())
         })
     }
 }

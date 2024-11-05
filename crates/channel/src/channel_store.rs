@@ -3,7 +3,7 @@ mod channel_index;
 use crate::{channel_buffer::ChannelBuffer, channel_chat::ChannelChat, ChannelMessage};
 use anyhow::{anyhow, Result};
 use channel_index::ChannelIndex;
-use client::{ChannelId, Client, ClientSettings, ProjectId, Subscription, User, UserId, UserStore};
+use client::{ChannelId, Client, ClientSettings, Subscription, User, UserId, UserStore};
 use collections::{hash_map, HashMap, HashSet};
 use futures::{channel::mpsc, future::Shared, Future, FutureExt, StreamExt};
 use gpui::{
@@ -33,30 +33,11 @@ struct NotesVersion {
     version: clock::Global,
 }
 
-#[derive(Debug, Clone)]
-pub struct HostedProject {
-    project_id: ProjectId,
-    channel_id: ChannelId,
-    name: SharedString,
-    _visibility: proto::ChannelVisibility,
-}
-impl From<proto::HostedProject> for HostedProject {
-    fn from(project: proto::HostedProject) -> Self {
-        Self {
-            project_id: ProjectId(project.project_id),
-            channel_id: ChannelId(project.channel_id),
-            _visibility: project.visibility(),
-            name: project.name.into(),
-        }
-    }
-}
 pub struct ChannelStore {
     pub channel_index: ChannelIndex,
     channel_invitations: Vec<Arc<Channel>>,
     channel_participants: HashMap<ChannelId, Vec<Arc<User>>>,
     channel_states: HashMap<ChannelId, ChannelState>,
-    hosted_projects: HashMap<ProjectId, HostedProject>,
-
     outgoing_invites: HashSet<(ChannelId, UserId)>,
     update_channels_tx: mpsc::UnboundedSender<proto::UpdateChannels>,
     opened_buffers: HashMap<ChannelId, OpenedModelHandle<ChannelBuffer>>,
@@ -85,7 +66,6 @@ pub struct ChannelState {
     observed_notes_version: NotesVersion,
     observed_chat_message: Option<u64>,
     role: Option<ChannelRole>,
-    projects: HashSet<ProjectId>,
 }
 
 impl Channel {
@@ -216,7 +196,6 @@ impl ChannelStore {
             channel_invitations: Vec::default(),
             channel_index: ChannelIndex::default(),
             channel_participants: Default::default(),
-            hosted_projects: Default::default(),
             outgoing_invites: Default::default(),
             opened_buffers: Default::default(),
             opened_chats: Default::default(),
@@ -249,15 +228,14 @@ impl ChannelStore {
     }
 
     pub fn initialize(&mut self) {
-        if !self.did_subscribe {
-            if self
+        if !self.did_subscribe
+            && self
                 .client
                 .send(proto::SubscribeToChannels {})
                 .log_err()
                 .is_some()
-            {
-                self.did_subscribe = true;
-            }
+        {
+            self.did_subscribe = true;
         }
     }
 
@@ -315,19 +293,6 @@ impl ChannelStore {
 
     pub fn channel_for_id(&self, channel_id: ChannelId) -> Option<&Arc<Channel>> {
         self.channel_index.by_id().get(&channel_id)
-    }
-
-    pub fn projects_for_id(&self, channel_id: ChannelId) -> Vec<(SharedString, ProjectId)> {
-        let mut projects: Vec<(SharedString, ProjectId)> = self
-            .channel_states
-            .get(&channel_id)
-            .map(|state| state.projects.clone())
-            .unwrap_or_default()
-            .into_iter()
-            .flat_map(|id| Some((self.hosted_projects.get(&id)?.name.clone(), id)))
-            .collect();
-        projects.sort();
-        projects
     }
 
     pub fn has_open_channel_buffer(&self, channel_id: ChannelId, _cx: &AppContext) -> bool {
@@ -423,7 +388,7 @@ impl ChannelStore {
     ) {
         self.channel_states
             .entry(channel_id)
-            .or_insert_with(|| Default::default())
+            .or_default()
             .acknowledge_message_id(message_id);
         cx.notify();
     }
@@ -436,7 +401,7 @@ impl ChannelStore {
     ) {
         self.channel_states
             .entry(channel_id)
-            .or_insert_with(|| Default::default())
+            .or_default()
             .update_latest_message_id(message_id);
         cx.notify();
     }
@@ -450,7 +415,7 @@ impl ChannelStore {
     ) {
         self.channel_states
             .entry(channel_id)
-            .or_insert_with(|| Default::default())
+            .or_default()
             .acknowledge_notes_version(epoch, version);
         cx.notify()
     }
@@ -464,7 +429,7 @@ impl ChannelStore {
     ) {
         self.channel_states
             .entry(channel_id)
-            .or_insert_with(|| Default::default())
+            .or_default()
             .update_latest_notes_version(epoch, version);
         cx.notify()
     }
@@ -924,7 +889,7 @@ impl ChannelStore {
                 if let Some(role) = ChannelRole::from_i32(membership.role) {
                     this.channel_states
                         .entry(ChannelId(membership.channel_id))
-                        .or_insert_with(|| ChannelState::default())
+                        .or_default()
                         .set_role(role)
                 }
             }
@@ -1008,7 +973,7 @@ impl ChannelStore {
                                                 .into_iter()
                                                 .map(language::proto::deserialize_operation)
                                                 .collect::<Result<Vec<_>>>()?;
-                                        buffer.apply_ops(incoming_operations, cx)?;
+                                        buffer.apply_ops(incoming_operations, cx);
                                         anyhow::Ok(outgoing_operations)
                                     })
                                     .log_err();
@@ -1094,11 +1059,7 @@ impl ChannelStore {
                         id: ChannelId(channel.id),
                         visibility: channel.visibility(),
                         name: channel.name.into(),
-                        parent_path: channel
-                            .parent_path
-                            .into_iter()
-                            .map(|cid| ChannelId(cid))
-                            .collect(),
+                        parent_path: channel.parent_path.into_iter().map(ChannelId).collect(),
                     }),
                 ),
             }
@@ -1107,20 +1068,15 @@ impl ChannelStore {
         let channels_changed = !payload.channels.is_empty()
             || !payload.delete_channels.is_empty()
             || !payload.latest_channel_message_ids.is_empty()
-            || !payload.latest_channel_buffer_versions.is_empty()
-            || !payload.hosted_projects.is_empty()
-            || !payload.deleted_hosted_projects.is_empty();
+            || !payload.latest_channel_buffer_versions.is_empty();
 
         if channels_changed {
             if !payload.delete_channels.is_empty() {
-                let delete_channels: Vec<ChannelId> = payload
-                    .delete_channels
-                    .into_iter()
-                    .map(|cid| ChannelId(cid))
-                    .collect();
+                let delete_channels: Vec<ChannelId> =
+                    payload.delete_channels.into_iter().map(ChannelId).collect();
                 self.channel_index.delete_channels(&delete_channels);
                 self.channel_participants
-                    .retain(|channel_id, _| !delete_channels.contains(&channel_id));
+                    .retain(|channel_id, _| !delete_channels.contains(channel_id));
 
                 for channel_id in &delete_channels {
                     let channel_id = *channel_id;
@@ -1168,34 +1124,6 @@ impl ChannelStore {
                     .entry(ChannelId(latest_channel_message.channel_id))
                     .or_default()
                     .update_latest_message_id(latest_channel_message.message_id);
-            }
-
-            for hosted_project in payload.hosted_projects {
-                let hosted_project: HostedProject = hosted_project.into();
-                if let Some(old_project) = self
-                    .hosted_projects
-                    .insert(hosted_project.project_id, hosted_project.clone())
-                {
-                    self.channel_states
-                        .entry(old_project.channel_id)
-                        .or_default()
-                        .remove_hosted_project(old_project.project_id);
-                }
-                self.channel_states
-                    .entry(hosted_project.channel_id)
-                    .or_default()
-                    .add_hosted_project(hosted_project.project_id);
-            }
-
-            for hosted_project_id in payload.deleted_hosted_projects {
-                let hosted_project_id = ProjectId(hosted_project_id);
-
-                if let Some(old_project) = self.hosted_projects.remove(&hosted_project_id) {
-                    self.channel_states
-                        .entry(old_project.channel_id)
-                        .or_default()
-                        .remove_hosted_project(old_project.project_id);
-                }
             }
         }
 
@@ -1302,13 +1230,5 @@ impl ChannelState {
                 version: version.clone(),
             };
         }
-    }
-
-    fn add_hosted_project(&mut self, project_id: ProjectId) {
-        self.projects.insert(project_id);
-    }
-
-    fn remove_hosted_project(&mut self, project_id: ProjectId) {
-        self.projects.remove(&project_id);
     }
 }

@@ -1,4 +1,4 @@
-import { danger, warn } from "danger";
+import { danger, message, warn } from "danger";
 const { prHygiene } = require("danger-plugin-pr-hygiene");
 
 prHygiene({
@@ -8,9 +8,11 @@ prHygiene({
   },
 });
 
-const RELEASE_NOTES_PATTERN = new RegExp("Release Notes:\\r?\\n\\s+-", "gm");
+const RELEASE_NOTES_PATTERN = /Release Notes:\r?\n\s+-/gm;
+const body = danger.github.pr.body;
 
-const hasReleaseNotes = RELEASE_NOTES_PATTERN.test(danger.github.pr.body);
+const hasReleaseNotes = RELEASE_NOTES_PATTERN.test(body);
+
 if (!hasReleaseNotes) {
   warn(
     [
@@ -21,7 +23,7 @@ if (!hasReleaseNotes) {
       "```",
       "Release Notes:",
       "",
-      "- (Added|Fixed|Improved) ... ([#<public_issue_number_if_exists>](https://github.com/zed-industries/zed/issues/<public_issue_number_if_exists>)).",
+      "- Added/Fixed/Improved ...",
       "```",
       "",
       'If your change is not user-facing, you can use "N/A" for the entry:',
@@ -34,21 +36,23 @@ if (!hasReleaseNotes) {
   );
 }
 
-const INCORRECT_ISSUE_LINK_PATTERN = new RegExp("-.*\\(#\\d+\\)", "g");
+const ISSUE_LINK_PATTERN =
+  /(?<!(?:Close[sd]?|Fixe[sd]|Resolve[sd]|Implement[sed]|Follow-up of|Part of)\s+)https:\/\/github\.com\/[\w-]+\/[\w-]+\/issues\/\d+/gi;
 
-const hasIncorrectIssueLinks = INCORRECT_ISSUE_LINK_PATTERN.test(
-  danger.github.pr.body,
-);
-if (hasIncorrectIssueLinks) {
-  warn(
+const bodyWithoutReleaseNotes = hasReleaseNotes ? body.split(/Release Notes:/)[0] : body;
+const includesIssueUrl = ISSUE_LINK_PATTERN.test(bodyWithoutReleaseNotes);
+
+if (includesIssueUrl) {
+  const matches = bodyWithoutReleaseNotes.match(ISSUE_LINK_PATTERN) ?? [];
+  const issues = matches
+    .map((match) => match.replace(/^#/, "").replace(/https:\/\/github\.com\/zed-industries\/zed\/issues\//, ""))
+    .filter((issue, index, self) => self.indexOf(issue) === index);
+
+  const issuesToReport = issues.map((issue) => `#${issue}`).join(", ");
+  message(
     [
-      "This PR has incorrectly formatted GitHub issue links in the release notes.",
-      "",
-      "GitHub issue links must be formatted as plain Markdown links:",
-      "",
-      "```",
-      "- Improved something ([#ISSUE](https://github.com/zed-industries/zed/issues/ISSUE)).",
-      "```",
+      `This PR includes links to the following GitHub Issues: ${issuesToReport}`,
+      "If this PR aims to close an issue, please include a `Closes #ISSUE` line at the top of the PR body.",
     ].join("\n"),
   );
 }

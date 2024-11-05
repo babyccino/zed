@@ -75,6 +75,18 @@ impl Keymap {
             .filter(move |binding| binding.action().partial_eq(action))
     }
 
+    /// all bindings for input returns all bindings that might match the input
+    /// (without checking context)
+    pub fn all_bindings_for_input(&self, input: &[Keystroke]) -> Vec<KeyBinding> {
+        self.bindings()
+            .rev()
+            .filter_map(|binding| {
+                binding.match_keystrokes(input).filter(|pending| !pending)?;
+                Some(binding.clone())
+            })
+            .collect()
+    }
+
     /// bindings_for_input returns a list of bindings that match the given input,
     /// and a boolean indicating whether or not more bindings might match if
     /// the input was longer.
@@ -130,7 +142,7 @@ impl Keymap {
             })
             .collect();
 
-        return (bindings, is_pending.unwrap_or_default());
+        (bindings, is_pending.unwrap_or_default())
     }
 
     /// Check if the given binding is enabled, given a certain key context.

@@ -85,7 +85,7 @@ impl RenderOnce for ThemeControl {
             ContextMenu::build(cx, |mut menu, cx| {
                 let theme_registry = ThemeRegistry::global(cx);
 
-                for theme in theme_registry.list_names(false) {
+                for theme in theme_registry.list_names() {
                     menu = menu.custom_entry(
                         {
                             let theme = theme.clone();
@@ -260,6 +260,7 @@ impl RenderOnce for UiFontSizeControl {
             .gap_2()
             .child(Icon::new(IconName::FontSize))
             .child(NumericStepper::new(
+                "ui-font-size",
                 value.to_string(),
                 move |_, cx| {
                     Self::write(value - px(1.), cx);
@@ -350,13 +351,7 @@ impl EditableSettingControl for UiFontLigaturesControl {
         let mut features = settings
             .ui_font_features
             .as_ref()
-            .map(|features| {
-                features
-                    .tag_value_list()
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
+            .map(|features| features.tag_value_list().to_vec())
             .unwrap_or_default();
 
         if let Some(calt_index) = features.iter().position(|(tag, _)| tag == "calt") {
