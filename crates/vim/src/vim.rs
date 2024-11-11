@@ -93,11 +93,9 @@ impl_actions!(vim, [SwitchMode, PushOperator, Number, SelectRegister]);
 pub fn init(cx: &mut AppContext) {
     VimModeSetting::register(cx);
     VimSettings::register(cx);
-
     VimGlobals::register(cx);
 
     easy_motion::init(cx);
-
     cx.observe_new_views(|editor: &mut Editor, cx| Vim::register(editor, cx))
         .detach();
 

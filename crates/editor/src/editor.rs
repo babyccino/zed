@@ -11624,7 +11624,7 @@ impl Editor {
         self.blame.as_ref()
     }
 
-    pub fn render_git_blame_gutter(&self, cx: &mut WindowContext) -> bool {
+    pub fn render_git_blame_gutter(&mut self, cx: &mut WindowContext) -> bool {
         self.show_git_blame_gutter && self.has_blame_entries(cx)
     }
 

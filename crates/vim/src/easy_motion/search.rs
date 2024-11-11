@@ -3,7 +3,7 @@ use std::{cmp::Ordering, ops::Range};
 use editor::{
     display_map::{DisplayRow, DisplaySnapshot},
     movement::{find_boundary_range_fold, TextLayoutDetails},
-    DisplayPoint, Editor, RowExt, RowRangeExt,
+    DisplayPoint, Editor, RowExt,
 };
 use itertools::Itertools;
 use language::CharClassifier;

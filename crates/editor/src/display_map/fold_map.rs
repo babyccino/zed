@@ -772,7 +772,7 @@ impl FoldSnapshot {
         }
     }
 
-    pub fn chars_at(&self, start: FoldPoint) -> impl Iterator<Item = char> + '_ {
+    pub fn chars_at(&self, start: FoldPoint) -> impl '_ + Iterator<Item = char> {
         self.chunks(
             start.to_offset(self)..self.len(),
             false,

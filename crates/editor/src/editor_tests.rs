@@ -169,8 +169,12 @@ fn test_undo_redo_with_selection_restoration(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 
     let mut now = Instant::now();
-    let buffer = cx.new_model(|cx| language::Buffer::local("123456", cx));
-    let group_interval = buffer.update(cx, |buffer, _| buffer.transaction_group_interval());
+    let group_interval = Duration::from_millis(1);
+    let buffer = cx.new_model(|cx| {
+        let mut buf = language::Buffer::local("123456", cx);
+        buf.set_group_interval(group_interval);
+        buf
+    });
     let buffer = cx.new_model(|cx| MultiBuffer::singleton(buffer, cx));
     let editor = cx.add_window(|cx| build_editor(buffer.clone(), cx));
 
@@ -4159,21 +4163,48 @@ async fn test_rewrap(cx: &mut TestAppContext) {
 
     let mut cx = EditorTestContext::new(cx).await;
 
-    {
-        let language = Arc::new(Language::new(
-            LanguageConfig {
-                line_comments: vec!["// ".into()],
-                ..LanguageConfig::default()
-            },
-            None,
-        ));
-        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
+    let language_with_c_comments = Arc::new(Language::new(
+        LanguageConfig {
+            line_comments: vec!["// ".into()],
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+    let language_with_pound_comments = Arc::new(Language::new(
+        LanguageConfig {
+            line_comments: vec!["# ".into()],
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+    let markdown_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Markdown".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+    let language_with_doc_comments = Arc::new(Language::new(
+        LanguageConfig {
+            line_comments: vec!["// ".into(), "/// ".into()],
+            ..LanguageConfig::default()
+        },
+        Some(tree_sitter_rust::LANGUAGE.into()),
+    ));
 
-        let unwrapped_text = indoc! {"
+    let plaintext_language = Arc::new(Language::new(
+        LanguageConfig {
+            name: "Plain Text".into(),
+            ..LanguageConfig::default()
+        },
+        None,
+    ));
+
+    assert_rewrap(
+        indoc! {"
             // ˇLorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus auctor, eu lacinia sapien scelerisque. Vivamus sit amet neque et quam tincidunt hendrerit. Praesent semper egestas tellus id dignissim. Pellentesque odio lectus, iaculis ac volutpat et, blandit quis urna. Sed vestibulum nisi sit amet nisl venenatis tempus. Donec molestie blandit quam, et porta nunc laoreet in. Integer sit amet scelerisque nisi. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras egestas porta metus, eu viverra ipsum efficitur quis. Donec luctus eros turpis, id vulputate turpis porttitor id. Aliquam id accumsan eros.
-        "};
-
-        let wrapped_text = indoc! {"
+        "},
+        indoc! {"
             // Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit
             // purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus
             // auctor, eu lacinia sapien scelerisque. Vivamus sit amet neque et quam
@@ -4184,29 +4215,17 @@ async fn test_rewrap(cx: &mut TestAppContext) {
             // dolor sit amet, consectetur adipiscing elit. Cras egestas porta metus, eu
             // viverra ipsum efficitur quis. Donec luctus eros turpis, id vulputate turpis
             // porttitor id. Aliquam id accumsan eros.ˇ
-        "};
-
-        cx.set_state(unwrapped_text);
-        cx.update_editor(|e, cx| e.rewrap(&Rewrap, cx));
-        cx.assert_editor_state(wrapped_text);
-    }
+        "},
+        language_with_c_comments.clone(),
+        &mut cx,
+    );
 
     // Test that rewrapping works inside of a selection
-    {
-        let language = Arc::new(Language::new(
-            LanguageConfig {
-                line_comments: vec!["// ".into()],
-                ..LanguageConfig::default()
-            },
-            None,
-        ));
-        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
-
-        let unwrapped_text = indoc! {"
+    assert_rewrap(
+        indoc! {"
             «// Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus auctor, eu lacinia sapien scelerisque. Vivamus sit amet neque et quam tincidunt hendrerit. Praesent semper egestas tellus id dignissim. Pellentesque odio lectus, iaculis ac volutpat et, blandit quis urna. Sed vestibulum nisi sit amet nisl venenatis tempus. Donec molestie blandit quam, et porta nunc laoreet in. Integer sit amet scelerisque nisi. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras egestas porta metus, eu viverra ipsum efficitur quis. Donec luctus eros turpis, id vulputate turpis porttitor id. Aliquam id accumsan eros.ˇ»
-        "};
-
-        let wrapped_text = indoc! {"
+        "},
+        indoc! {"
             // Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit
             // purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus
             // auctor, eu lacinia sapien scelerisque. Vivamus sit amet neque et quam
@@ -4217,32 +4236,20 @@ async fn test_rewrap(cx: &mut TestAppContext) {
             // dolor sit amet, consectetur adipiscing elit. Cras egestas porta metus, eu
             // viverra ipsum efficitur quis. Donec luctus eros turpis, id vulputate turpis
             // porttitor id. Aliquam id accumsan eros.ˇ
-        "};
-
-        cx.set_state(unwrapped_text);
-        cx.update_editor(|e, cx| e.rewrap(&Rewrap, cx));
-        cx.assert_editor_state(wrapped_text);
-    }
+        "},
+        language_with_c_comments.clone(),
+        &mut cx,
+    );
 
     // Test that cursors that expand to the same region are collapsed.
-    {
-        let language = Arc::new(Language::new(
-            LanguageConfig {
-                line_comments: vec!["// ".into()],
-                ..LanguageConfig::default()
-            },
-            None,
-        ));
-        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
-
-        let unwrapped_text = indoc! {"
+    assert_rewrap(
+        indoc! {"
             // ˇLorem ipsum dolor sit amet, consectetur adipiscing elit.
             // ˇVivamus mollis elit purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus auctor, eu lacinia sapien scelerisque.
             // ˇVivamus sit amet neque et quam tincidunt hendrerit. Praesent semper egestas tellus id dignissim. Pellentesque odio lectus, iaculis ac volutpat et,
             // ˇblandit quis urna. Sed vestibulum nisi sit amet nisl venenatis tempus. Donec molestie blandit quam, et porta nunc laoreet in. Integer sit amet scelerisque nisi. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras egestas porta metus, eu viverra ipsum efficitur quis. Donec luctus eros turpis, id vulputate turpis porttitor id. Aliquam id accumsan eros.
-        "};
-
-        let wrapped_text = indoc! {"
+        "},
+        indoc! {"
             // Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit
             // purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus
             // auctor, eu lacinia sapien scelerisque. Vivamus sit amet neque et quam
@@ -4253,33 +4260,21 @@ async fn test_rewrap(cx: &mut TestAppContext) {
             // dolor sit amet, consectetur adipiscing elit. Cras egestas porta metus, eu
             // viverra ipsum efficitur quis. Donec luctus eros turpis, id vulputate turpis
             // porttitor id. Aliquam id accumsan eros.ˇ
-        "};
-
-        cx.set_state(unwrapped_text);
-        cx.update_editor(|e, cx| e.rewrap(&Rewrap, cx));
-        cx.assert_editor_state(wrapped_text);
-    }
+        "},
+        language_with_c_comments.clone(),
+        &mut cx,
+    );
 
     // Test that non-contiguous selections are treated separately.
-    {
-        let language = Arc::new(Language::new(
-            LanguageConfig {
-                line_comments: vec!["// ".into()],
-                ..LanguageConfig::default()
-            },
-            None,
-        ));
-        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
-
-        let unwrapped_text = indoc! {"
+    assert_rewrap(
+        indoc! {"
             // ˇLorem ipsum dolor sit amet, consectetur adipiscing elit.
             // ˇVivamus mollis elit purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus auctor, eu lacinia sapien scelerisque.
             //
             // ˇVivamus sit amet neque et quam tincidunt hendrerit. Praesent semper egestas tellus id dignissim. Pellentesque odio lectus, iaculis ac volutpat et,
             // ˇblandit quis urna. Sed vestibulum nisi sit amet nisl venenatis tempus. Donec molestie blandit quam, et porta nunc laoreet in. Integer sit amet scelerisque nisi. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras egestas porta metus, eu viverra ipsum efficitur quis. Donec luctus eros turpis, id vulputate turpis porttitor id. Aliquam id accumsan eros.
-        "};
-
-        let wrapped_text = indoc! {"
+        "},
+        indoc! {"
             // Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit
             // purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus
             // auctor, eu lacinia sapien scelerisque.ˇ
@@ -4291,29 +4286,17 @@ async fn test_rewrap(cx: &mut TestAppContext) {
             // nisi. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras egestas
             // porta metus, eu viverra ipsum efficitur quis. Donec luctus eros turpis, id
             // vulputate turpis porttitor id. Aliquam id accumsan eros.ˇ
-        "};
-
-        cx.set_state(unwrapped_text);
-        cx.update_editor(|e, cx| e.rewrap(&Rewrap, cx));
-        cx.assert_editor_state(wrapped_text);
-    }
+        "},
+        language_with_c_comments.clone(),
+        &mut cx,
+    );
 
     // Test that different comment prefixes are supported.
-    {
-        let language = Arc::new(Language::new(
-            LanguageConfig {
-                line_comments: vec!["# ".into()],
-                ..LanguageConfig::default()
-            },
-            None,
-        ));
-        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
-
-        let unwrapped_text = indoc! {"
+    assert_rewrap(
+        indoc! {"
             # ˇLorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus auctor, eu lacinia sapien scelerisque. Vivamus sit amet neque et quam tincidunt hendrerit. Praesent semper egestas tellus id dignissim. Pellentesque odio lectus, iaculis ac volutpat et, blandit quis urna. Sed vestibulum nisi sit amet nisl venenatis tempus. Donec molestie blandit quam, et porta nunc laoreet in. Integer sit amet scelerisque nisi. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Cras egestas porta metus, eu viverra ipsum efficitur quis. Donec luctus eros turpis, id vulputate turpis porttitor id. Aliquam id accumsan eros.
-        "};
-
-        let wrapped_text = indoc! {"
+        "},
+        indoc! {"
             # Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit
             # purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus auctor,
             # eu lacinia sapien scelerisque. Vivamus sit amet neque et quam tincidunt
@@ -4324,63 +4307,39 @@ async fn test_rewrap(cx: &mut TestAppContext) {
             # adipiscing elit. Cras egestas porta metus, eu viverra ipsum efficitur quis.
             # Donec luctus eros turpis, id vulputate turpis porttitor id. Aliquam id
             # accumsan eros.ˇ
-        "};
-
-        cx.set_state(unwrapped_text);
-        cx.update_editor(|e, cx| e.rewrap(&Rewrap, cx));
-        cx.assert_editor_state(wrapped_text);
-    }
+        "},
+        language_with_pound_comments.clone(),
+        &mut cx,
+    );
 
     // Test that rewrapping is ignored outside of comments in most languages.
-    {
-        let language = Arc::new(Language::new(
-            LanguageConfig {
-                line_comments: vec!["// ".into(), "/// ".into()],
-                ..LanguageConfig::default()
-            },
-            Some(tree_sitter_rust::LANGUAGE.into()),
-        ));
-        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
-
-        let unwrapped_text = indoc! {"
+    assert_rewrap(
+        indoc! {"
             /// Adds two numbers.
             /// Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit purus, a ornare lacus gravida vitae.ˇ
             fn add(a: u32, b: u32) -> u32 {
                 a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + bˇ
             }
-        "};
-
-        let wrapped_text = indoc! {"
+        "},
+        indoc! {"
             /// Adds two numbers. Lorem ipsum dolor sit amet, consectetur adipiscing elit.
             /// Vivamus mollis elit purus, a ornare lacus gravida vitae.ˇ
             fn add(a: u32, b: u32) -> u32 {
                 a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + b + a + bˇ
             }
-        "};
-
-        cx.set_state(unwrapped_text);
-        cx.update_editor(|e, cx| e.rewrap(&Rewrap, cx));
-        cx.assert_editor_state(wrapped_text);
-    }
+        "},
+        language_with_doc_comments.clone(),
+        &mut cx,
+    );
 
     // Test that rewrapping works in Markdown and Plain Text languages.
-    {
-        let markdown_language = Arc::new(Language::new(
-            LanguageConfig {
-                name: "Markdown".into(),
-                ..LanguageConfig::default()
-            },
-            None,
-        ));
-        cx.update_buffer(|buffer, cx| buffer.set_language(Some(markdown_language), cx));
-
-        let unwrapped_text = indoc! {"
+    assert_rewrap(
+        indoc! {"
             # Hello
 
             Lorem ipsum dolor sit amet, ˇconsectetur adipiscing elit. Vivamus mollis elit purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus auctor, eu lacinia sapien scelerisque. Vivamus sit amet neque et quam tincidunt hendrerit. Praesent semper egestas tellus id dignissim. Pellentesque odio lectus, iaculis ac volutpat et, blandit quis urna. Sed vestibulum nisi sit amet nisl venenatis tempus. Donec molestie blandit quam, et porta nunc laoreet in. Integer sit amet scelerisque nisi.
-        "};
-
-        let wrapped_text = indoc! {"
+        "},
+        indoc! {"
             # Hello
 
             Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit
@@ -4390,26 +4349,16 @@ async fn test_rewrap(cx: &mut TestAppContext) {
             lectus, iaculis ac volutpat et, blandit quis urna. Sed vestibulum nisi sit amet
             nisl venenatis tempus. Donec molestie blandit quam, et porta nunc laoreet in.
             Integer sit amet scelerisque nisi.ˇ
-        "};
+        "},
+        markdown_language,
+        &mut cx,
+    );
 
-        cx.set_state(unwrapped_text);
-        cx.update_editor(|e, cx| e.rewrap(&Rewrap, cx));
-        cx.assert_editor_state(wrapped_text);
-
-        let plaintext_language = Arc::new(Language::new(
-            LanguageConfig {
-                name: "Plain Text".into(),
-                ..LanguageConfig::default()
-            },
-            None,
-        ));
-        cx.update_buffer(|buffer, cx| buffer.set_language(Some(plaintext_language), cx));
-
-        let unwrapped_text = indoc! {"
+    assert_rewrap(
+        indoc! {"
             Lorem ipsum dolor sit amet, ˇconsectetur adipiscing elit. Vivamus mollis elit purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus auctor, eu lacinia sapien scelerisque. Vivamus sit amet neque et quam tincidunt hendrerit. Praesent semper egestas tellus id dignissim. Pellentesque odio lectus, iaculis ac volutpat et, blandit quis urna. Sed vestibulum nisi sit amet nisl venenatis tempus. Donec molestie blandit quam, et porta nunc laoreet in. Integer sit amet scelerisque nisi.
-        "};
-
-        let wrapped_text = indoc! {"
+        "},
+        indoc! {"
             Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit
             purus, a ornare lacus gravida vitae. Proin consectetur felis vel purus auctor,
             eu lacinia sapien scelerisque. Vivamus sit amet neque et quam tincidunt
@@ -4417,25 +4366,14 @@ async fn test_rewrap(cx: &mut TestAppContext) {
             lectus, iaculis ac volutpat et, blandit quis urna. Sed vestibulum nisi sit amet
             nisl venenatis tempus. Donec molestie blandit quam, et porta nunc laoreet in.
             Integer sit amet scelerisque nisi.ˇ
-        "};
-
-        cx.set_state(unwrapped_text);
-        cx.update_editor(|e, cx| e.rewrap(&Rewrap, cx));
-        cx.assert_editor_state(wrapped_text);
-    }
+        "},
+        plaintext_language,
+        &mut cx,
+    );
 
     // Test rewrapping unaligned comments in a selection.
-    {
-        let language = Arc::new(Language::new(
-            LanguageConfig {
-                line_comments: vec!["// ".into(), "/// ".into()],
-                ..LanguageConfig::default()
-            },
-            Some(tree_sitter_rust::LANGUAGE.into()),
-        ));
-        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
-
-        let unwrapped_text = indoc! {"
+    assert_rewrap(
+        indoc! {"
             fn foo() {
                 if true {
             «        // Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit purus, a ornare lacus gravida vitae.
@@ -4445,9 +4383,8 @@ async fn test_rewrap(cx: &mut TestAppContext) {
                     //
                 }
             }
-        "};
-
-        let wrapped_text = indoc! {"
+        "},
+        indoc! {"
             fn foo() {
                 if true {
                     // Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus
@@ -4458,13 +4395,13 @@ async fn test_rewrap(cx: &mut TestAppContext) {
                     //
                 }
             }
-        "};
+        "},
+        language_with_doc_comments.clone(),
+        &mut cx,
+    );
 
-        cx.set_state(unwrapped_text);
-        cx.update_editor(|e, cx| e.rewrap(&Rewrap, cx));
-        cx.assert_editor_state(wrapped_text);
-
-        let unwrapped_text = indoc! {"
+    assert_rewrap(
+        indoc! {"
             fn foo() {
                 if true {
             «ˇ        // Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus mollis elit purus, a ornare lacus gravida vitae.
@@ -4475,9 +4412,8 @@ async fn test_rewrap(cx: &mut TestAppContext) {
                 }
 
             }
-        "};
-
-        let wrapped_text = indoc! {"
+        "},
+        indoc! {"
             fn foo() {
                 if true {
                     // Lorem ipsum dolor sit amet, consectetur adipiscing elit. Vivamus
@@ -4489,8 +4425,19 @@ async fn test_rewrap(cx: &mut TestAppContext) {
                 }
 
             }
-        "};
+        "},
+        language_with_doc_comments.clone(),
+        &mut cx,
+    );
 
+    #[track_caller]
+    fn assert_rewrap(
+        unwrapped_text: &str,
+        wrapped_text: &str,
+        language: Arc<Language>,
+        cx: &mut EditorTestContext,
+    ) {
+        cx.update_buffer(|buffer, cx| buffer.set_language(Some(language), cx));
         cx.set_state(unwrapped_text);
         cx.update_editor(|e, cx| e.rewrap(&Rewrap, cx));
         cx.assert_editor_state(wrapped_text);
@@ -10591,11 +10538,7 @@ async fn test_completions_in_languages_with_extra_word_characters(cx: &mut gpui:
     cx.update_editor(|editor, _| {
         if let Some(ContextMenu::Completions(menu)) = editor.context_menu.read().as_ref() {
             assert_eq!(
-                menu.matches
-                    .read()
-                    .iter()
-                    .map(|m| &m.string)
-                    .collect::<Vec<_>>(),
+                menu.matches.iter().map(|m| &m.string).collect::<Vec<_>>(),
                 &["bg-red", "bg-blue", "bg-yellow"]
             );
         } else {
@@ -10608,11 +10551,7 @@ async fn test_completions_in_languages_with_extra_word_characters(cx: &mut gpui:
     cx.update_editor(|editor, _| {
         if let Some(ContextMenu::Completions(menu)) = editor.context_menu.read().as_ref() {
             assert_eq!(
-                menu.matches
-                    .read()
-                    .iter()
-                    .map(|m| &m.string)
-                    .collect::<Vec<_>>(),
+                menu.matches.iter().map(|m| &m.string).collect::<Vec<_>>(),
                 &["bg-blue", "bg-yellow"]
             );
         } else {
@@ -10628,11 +10567,7 @@ async fn test_completions_in_languages_with_extra_word_characters(cx: &mut gpui:
     cx.update_editor(|editor, _| {
         if let Some(ContextMenu::Completions(menu)) = editor.context_menu.read().as_ref() {
             assert_eq!(
-                menu.matches
-                    .read()
-                    .iter()
-                    .map(|m| &m.string)
-                    .collect::<Vec<_>>(),
+                menu.matches.iter().map(|m| &m.string).collect::<Vec<_>>(),
                 &["bg-yellow"]
             );
         } else {
