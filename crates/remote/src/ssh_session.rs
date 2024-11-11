@@ -40,7 +40,7 @@ use std::{
     ops::ControlFlow,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU32, Ordering::SeqCst},
+        atomic::{AtomicU32, AtomicU64, Ordering::SeqCst},
         Arc, Weak,
     },
     time::{Duration, Instant},
@@ -484,11 +484,16 @@ impl EventEmitter<SshRemoteEvent> for SshRemoteClient {}
 // Identifies the socket on the remote server so that reconnects
 // can re-join the same project.
 pub enum ConnectionIdentifier {
-    Setup,
+    Setup(u64),
     Workspace(i64),
 }
 
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
 impl ConnectionIdentifier {
+    pub fn setup() -> Self {
+        Self::Setup(NEXT_ID.fetch_add(1, SeqCst))
+    }
     // This string gets used in a socket name, and so must be relatively short.
     // The total length of:
     //   /home/{username}/.local/share/zed/server_state/{name}/stdout.sock
@@ -501,7 +506,7 @@ impl ConnectionIdentifier {
             release_channel => format!("{}-", release_channel.dev_name()),
         };
         match self {
-            Self::Setup => format!("{identifier_prefix}setup"),
+            Self::Setup(setup_id) => format!("{identifier_prefix}setup-{setup_id}"),
             Self::Workspace(workspace_id) => {
                 format!("{identifier_prefix}workspace-{workspace_id}",)
             }
@@ -985,6 +990,19 @@ impl SshRemoteClient {
             .map(|ssh_connection| ssh_connection.ssh_args())
     }
 
+    pub fn upload_directory(
+        &self,
+        src_path: PathBuf,
+        dest_path: PathBuf,
+        cx: &AppContext,
+    ) -> Task<Result<()>> {
+        let state = self.state.lock();
+        let Some(connection) = state.as_ref().and_then(|state| state.ssh_connection()) else {
+            return Task::ready(Err(anyhow!("no ssh connection")));
+        };
+        connection.upload_directory(src_path, dest_path, cx)
+    }
+
     pub fn proto_client(&self) -> AnyProtoClient {
         self.client.clone().into()
     }
@@ -1079,7 +1097,7 @@ impl SshRemoteClient {
         client_cx
             .update(|cx| {
                 Self::new(
-                    ConnectionIdentifier::Setup,
+                    ConnectionIdentifier::setup(),
                     opts,
                     rx,
                     Arc::new(fake::Delegate),
@@ -1189,6 +1207,12 @@ trait RemoteConnection: Send + Sync {
         delegate: Arc<dyn SshClientDelegate>,
         cx: &mut AsyncAppContext,
     ) -> Task<Result<i32>>;
+    fn upload_directory(
+        &self,
+        src_path: PathBuf,
+        dest_path: PathBuf,
+        cx: &AppContext,
+    ) -> Task<Result<()>>;
     async fn kill(&self) -> Result<()>;
     fn has_been_killed(&self) -> bool;
     fn ssh_args(&self) -> Vec<String>;
@@ -1227,6 +1251,49 @@ impl RemoteConnection for SshRemoteConnection {
     fn connection_options(&self) -> SshConnectionOptions {
         self.socket.connection_options.clone()
     }
+
+    fn upload_directory(
+        &self,
+        src_path: PathBuf,
+        dest_path: PathBuf,
+        cx: &AppContext,
+    ) -> Task<Result<()>> {
+        let mut command = process::Command::new("scp");
+        let output = self
+            .socket
+            .ssh_options(&mut command)
+            .args(
+                self.socket
+                    .connection_options
+                    .port
+                    .map(|port| vec!["-P".to_string(), port.to_string()])
+                    .unwrap_or_default(),
+            )
+            .arg("-r")
+            .arg(&src_path)
+            .arg(format!(
+                "{}:{}",
+                self.socket.connection_options.scp_url(),
+                dest_path.display()
+            ))
+            .output();
+
+        cx.background_executor().spawn(async move {
+            let output = output.await?;
+
+            if !output.status.success() {
+                return Err(anyhow!(
+                    "failed to upload directory {} -> {}: {}",
+                    src_path.display(),
+                    dest_path.display(),
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+
+            Ok(())
+        })
+    }
+
     fn start_proxy(
         &self,
         unique_identifier: String,
@@ -2281,7 +2348,7 @@ mod fake {
         },
         select_biased, FutureExt, SinkExt, StreamExt,
     };
-    use gpui::{AsyncAppContext, SemanticVersion, Task, TestAppContext};
+    use gpui::{AppContext, AsyncAppContext, SemanticVersion, Task, TestAppContext};
     use release_channel::ReleaseChannel;
     use rpc::proto::Envelope;
 
@@ -2324,6 +2391,14 @@ mod fake {
 
         fn ssh_args(&self) -> Vec<String> {
             Vec::new()
+        }
+        fn upload_directory(
+            &self,
+            _src_path: PathBuf,
+            _dest_path: PathBuf,
+            _cx: &AppContext,
+        ) -> Task<Result<()>> {
+            unreachable!()
         }
 
         fn connection_options(&self) -> SshConnectionOptions {
