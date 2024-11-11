@@ -9,7 +9,7 @@ use editor::{
     EditorEvent, MultiBufferSnapshot, ToPoint,
 };
 use gpui::{
-    actions, impl_actions, saturate, Action, AppContext, HighlightStyle, KeystrokeEvent, View,
+    actions, impl_actions, Action, AppContext, HighlightStyle, Hsla, KeystrokeEvent, View,
     ViewContext, WeakView,
 };
 use settings::{Settings, SettingsSources};
@@ -442,6 +442,12 @@ impl EasyMotion {
         };
         (style_0, style_1, style_2)
     }
+}
+
+/// substitutes saturation with given value
+pub fn saturate(mut color: Hsla, s: f32) -> Hsla {
+    color.s = s;
+    color
 }
 
 #[derive(Deserialize)]

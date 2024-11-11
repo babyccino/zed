@@ -35,8 +35,8 @@ pub use block_map::{
 use block_map::{BlockRow, BlockSnapshot};
 use collections::{HashMap, HashSet};
 pub use crease_map::*;
-pub use fold_map::{Fold, FoldId, FoldPlaceholder, FoldPoint};
-use fold_map::{FoldMap, FoldMapWriter, FoldOffset, FoldSnapshot};
+pub use fold_map::{Fold, FoldId, FoldOffset, FoldPlaceholder, FoldPoint, FoldSnapshot};
+use fold_map::{FoldMap, FoldMapWriter};
 use gpui::{
     AnyElement, Font, HighlightStyle, LineLayout, Model, ModelContext, Pixels, UnderlineStyle,
 };

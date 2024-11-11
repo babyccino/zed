@@ -3,7 +3,7 @@ use std::{cmp::Ordering, ops::Range};
 use editor::{
     display_map::{DisplayRow, DisplaySnapshot},
     movement::{find_boundary_range_fold, TextLayoutDetails},
-    DisplayPoint, Editor, RowExt,
+    DisplayPoint, Editor, RowExt, RowRangeExt,
 };
 use itertools::Itertools;
 use language::CharClassifier;
@@ -96,7 +96,7 @@ pub fn row_starts(
 pub fn word_starts(
     word_type: WordType,
     direction: Direction,
-    editor: &Editor,
+    editor: &mut Editor,
     cx: &mut ViewContext<Editor>,
 ) -> Vec<DisplayPoint> {
     let selections = editor.selections.newest_display(cx);
