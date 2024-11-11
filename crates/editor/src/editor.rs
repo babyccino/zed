@@ -2129,7 +2129,7 @@ impl Editor {
             .is_some_and(|menu| menu.context_menu.focus_handle(cx).is_focused(cx))
     }
 
-    pub fn key_context(&self, cx: &ViewContext<Self>) -> KeyContext {
+    fn key_context(&self, cx: &ViewContext<Self>) -> KeyContext {
         let mut key_context = KeyContext::new_with_defaults();
         key_context.add("Editor");
         let mode = match self.mode {
@@ -12350,12 +12350,6 @@ impl Editor {
                     ..range.end.to_display_point(display_snapshot)
             })
             .collect()
-    }
-
-    pub fn add_overlay<T: 'static>(&mut self, overlay: Overlay, cx: &mut ViewContext<Self>) {
-        let list = self.overlay_map.entry(TypeId::of::<T>()).or_default();
-        list.push(overlay);
-        cx.notify();
     }
 
     pub fn add_overlays_with_reserve<T: 'static>(

@@ -5751,7 +5751,6 @@ impl Element for EditorElement {
                     }
                 }
             });
-
         let rem_size = self.rem_size(cx);
         cx.with_rem_size(rem_size, |cx| {
             cx.with_text_style(Some(text_style), |cx| {
